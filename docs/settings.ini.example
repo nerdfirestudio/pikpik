@@ -47,7 +47,7 @@ gamepad = 1
 # server and key are set; a half-set pair warns on stdout rather than failing
 # quietly. Overridable with PC_SYNC_SERVER / PC_SYNC_KEY / PC_SYNC_DEVICE.
 
-# Base URL of the sync server (the prior port/sync-server). Empty = sync off.
+# Base URL of the sync server (the sync server). Empty = sync off.
 # Plain http is fine on a LAN. On iOS anything outside the LAN needs https,
 # because App Transport Security is only lifted for local addresses.
 server =

@@ -6,7 +6,7 @@ extern "C" {
 #endif
 
 // Save sync across this user's own devices, against the prior port's sync-server
-// (the prior port/sync-server/server.js). See docs/SAVE_SYNC.md.
+// (the sync server). See docs/SAVE_SYNC.md.
 //
 // The whole feature is off unless BOTH settings.ini keys are set:
 //

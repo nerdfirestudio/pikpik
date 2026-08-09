@@ -7,7 +7,7 @@
 //             heartbeats the lease
 //   leave     upload if changed, release the lease
 //
-// The server (the prior port/sync-server) never parses the blob, and its lock is
+// The server (the sync server) never parses the blob, and its lock is
 // per-device-per-town — which is exactly this case: three devices sharing one
 // save, where the SAME device may retake its own lease after a crash but any
 // other device gets a 409.

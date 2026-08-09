@@ -1,7 +1,11 @@
 # Save sync
 
 One save file shared across a Mac, an iPad and an iPhone, over
-[the prior port's sync server](../../the prior port/sync-server/). Off unless configured.
+a small companion sync server. Off unless configured.
+
+> **The server is not published yet.** The client half ships here and works;
+> the server it talks to has not been released. Until it is, this section
+> describes something you cannot run yet.
 
 The problem it solves is not backup — it is that three devices with one save
 is a clobbering machine. You play a day on the iPad, forget, and start the
@@ -11,7 +15,7 @@ may hold the save at a time, and the others are told who has it.
 ## Setting it up
 
 Run the server somewhere that stays on (`node server.js` in
-`the prior port/sync-server`; zero dependencies, any Node ≥ 18). Then in
+the sync server; zero dependencies, any Node ≥ 18). Then in
 `settings.ini` on **each** device:
 
 ```ini

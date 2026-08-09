@@ -39,6 +39,11 @@ All of the following is original work by the pikpik authors, licensed MIT
     repository in any form, compressed, encoded, or otherwise. A build is
     inert without a copy you supply yourself from your own disc.
 
+    Not even a screenshot. The one in the README shows this port rendering
+    Nintendo's artwork, so it is hosted outside this repository and embedded
+    by URL. Cloning this repository copies no image of the game to your
+    disk.
+
     Any tool for obtaining game data.  This repository contains no ripper,
     no downloader, and no circumvention code, and points at none.
 

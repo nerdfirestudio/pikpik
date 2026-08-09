@@ -87,6 +87,14 @@ None are included, and none ever will be. The build reads an extracted disc
 filesystem at a path you configure; without it the program starts, finds no
 data, and stops.
 
+That extends to screenshots. The README shows one, because documentation that
+cannot show what the software does is poor documentation — but what it depicts
+is Nintendo's artwork rendered by this port, so it is hosted in a separate
+repository and embedded by URL rather than committed here. The distinction is a
+fine one and it is drawn deliberately: it keeps section 2's claim literally
+true, and it means a request to take the image down is satisfied somewhere else
+entirely, without touching this repository or its history.
+
 Supply it yourself, from your own disc. Whether ripping a disc you own is
 lawful depends on where you live: some jurisdictions permit a personal backup,
 others prohibit circumventing the copy protection required to make one, and

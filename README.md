@@ -7,6 +7,29 @@ Runs on Apple Silicon. Renders through Metal, mixes audio by emulating the
 GameCube's DSP, emulates the memory card for saves, and — on iPad and iPhone —
 takes touch input. Status: **playable start to finish.**
 
+![Day 1 on The Impact Site, running on an iPad with the port's on-screen touch
+controls visible](https://raw.githubusercontent.com/magikarp/assets/main/screenshot.jpg)
+
+## What works
+
+| | |
+|---|---|
+| **Rendering** | The GameCube's TEV pipeline translated to Metal, at your display's resolution and refresh rate |
+| **Audio** | Full DSP emulation — music, effects, streamed sequences and the reverb bus, not a stub |
+| **FMV** | The game's HVQM4 videos play |
+| **Saves** | Memory-card emulation backed by host files. Existing `.gci` saves can be imported |
+| **Gamepads** | Anything SDL recognises, on both platforms. On iOS, pair it in Settings and it maps positionally — no per-pad setup |
+| **Keyboard** | Fully rebindable through `keybindings.ini` |
+| **Touch** | An on-screen controller on iPhone and iPad, live alongside a gamepad |
+| **HD texture packs** | Optional. Point `PC_HD_TEXTURES` at a Dolphin-format pack; a texture with no replacement falls through to the original. BC7 packs need no CPU decoder on M-series hardware |
+| **Save sync** | Optional, and **pre-release**: the client is here and works, but the small server it talks to has not been published yet. One save shared across your Mac, iPad and iPhone, with a lease so two devices cannot both edit it |
+
+**Widescreen is not supported.** The game renders at its original 4:3 aspect and
+is pillarboxed. This is not on the roadmap.
+
+Everything else is the game as it shipped — this is a port, not a remaster, and
+where the original had a quirk the port keeps it.
+
 > **This repository contains no game code and no game assets.**
 > It is the port layer. `setup.sh` fetches the decompiled sources from their own
 > upstream project at build time, and you supply the game data yourself from a
