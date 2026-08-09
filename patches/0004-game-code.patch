@@ -1,0 +1,2865 @@
+diff --git a/src/plugPikiColin/animMgr.cpp b/src/plugPikiColin/animMgr.cpp
+index 6b09e65..a6bb6dc 100644
+--- a/src/plugPikiColin/animMgr.cpp
++++ b/src/plugPikiColin/animMgr.cpp
+@@ -354,7 +354,26 @@ void AnimMgr::loadAnims(immut char* animPath, immut char* bundlePath)
+ 			sprintf(finalBundlePath, bundlePath ? bundlePath : mModel->mName);
+ 
+ 			if (!bundlePath) {
+-				sprintf(&finalAnimPath[strlen(finalBundlePath) + 253], "anm");
++				// PC: retail writes this through finalAnimPath —
++				// `sprintf(&finalAnimPath[strlen(finalBundlePath) + 253], "anm")` — which
++				// is 253 == PATH_MAX - 3 bytes past that buffer's start, i.e. OFF THE END
++				// of a char[256]. It only works because the three path buffers are adjacent
++				// frame slots, so the address lands on &finalBundlePath[len - 3]: the write
++				// is retagging the model name's extension .mod -> .anm for the loadBundle
++				// below. Verified at runtime, not inferred — both addresses printed equal
++				// (0x16fab9fb0) and the string really did change to
++				// "cinemas/opening/opening.anm".
++				//
++				// That is a stack overwrite whose correctness rests entirely on -O0's
++				// frame layout, and it is load-bearing: at -O2 clang may reorder or
++				// coalesce these buffers, the write stops aliasing finalBundlePath, and
++				// every bundle-loaded animation set silently loads from ".mod" instead.
++				// Addressing the buffer it actually means is the same store at -O0 and
++				// stays correct at any optimisation level.
++				size_t bundleLen = strlen(finalBundlePath);
++				if (bundleLen >= 3) {
++					sprintf(&finalBundlePath[bundleLen - 3], "anm");
++				}
+ 			}
+ 
+ 			gsys->loadBundle(finalBundlePath, false);
+diff --git a/src/plugPikiColin/cardutil.cpp b/src/plugPikiColin/cardutil.cpp
+index fd95a20..d9bc825 100644
+--- a/src/plugPikiColin/cardutil.cpp
++++ b/src/plugPikiColin/cardutil.cpp
+@@ -1,4 +1,5 @@
+ #include "CardUtil.h"
++#include "pc_uninit.h"
+ 
+ #include "DebugLog.h"
+ #include "gameflow.h"
+@@ -67,7 +68,7 @@ s32* CardUtilByteNotUsed()
+  */
+ s32 CardUtilBlocksNotUsed()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+@@ -560,13 +561,13 @@ static s32 DoSave(s32 chan, CARDStat* fileState, void* fileData)
+ 
+ 	// copy comment data from save buffer, if present
+ 	if (fileState->commentAddr <= fileState->length - CARD_COMMENT_SIZE) {
+-		memmove(entry->mFileCommentData, (void*)((u32)fileData + fileState->commentAddr), CARD_COMMENT_SIZE);
++		memmove(entry->mFileCommentData, (void*)((uintptr_t)fileData + fileState->commentAddr), CARD_COMMENT_SIZE);
+ 	}
+ 
+ 	// handle icon/banner data, if present
+ 	entry->mAnimTotalFrames = 0;
+ 	if (fileState->bannerFormat || fileState->iconFormat) {
+-		memmove(entry, (void*)((u32)fileData + fileState->iconAddr), fileState->offsetData - fileState->iconAddr);
++		memmove(entry, (void*)((uintptr_t)fileData + fileState->iconAddr), fileState->offsetData - fileState->iconAddr);
+ 		DCFlushRange(entry, fileState->offsetData - fileState->iconAddr);
+ 
+ 		int iconCnt;
+@@ -618,7 +619,13 @@ static s32 DoSave(s32 chan, CARDStat* fileState, void* fileData)
+  * @param length Length for write operations.
+  * @return CARD result code from last operation hit - 0 or 1 if no error, negative if error.
+  */
+-static s32 CardUtilCommand(s32 chan, s32 command, s32 file, void* workBuffer, u32 offset, u32 length)
++// `file` is overloaded by command: a directory index for Erase/Open/Write,
++// but a CARDStat POINTER for Save (which is why mFileNo is a void*). It was
++// declared s32 — pointer-width on GC, but a 32-bit TRUNCATION on LP64, so
++// DoSave received a chopped CARDStat* and strncpy'd through it (segfault on
++// the "creating a save file" screen). uintptr_t is identical to the original
++// on a 32-bit target and correct on 64-bit.
++static s32 CardUtilCommand(s32 chan, s32 command, uintptr_t file, void* workBuffer, u32 offset, u32 length)
+ {
+ 	OSLockMutex(&CardControl.mMutex);
+ 	int res;
+@@ -741,8 +748,9 @@ void CardUtilOpen(s32 chan, s32 fileNo, void* workBuffer)
+  */
+ void CardUtilSave(s32 chan, CARDStat* fileState, void* data)
+ {
+-	// no clue why they needed to force the CARDStat pointer in as a long
+-	CardUtilCommand(chan, CARDCMD_Save, (s32)fileState, data, 0, 0);
++	// the CARDStat pointer rides the command's `file` slot (see the note on
++	// CardUtilCommand) — must stay pointer-width, never (s32)
++	CardUtilCommand(chan, CARDCMD_Save, (uintptr_t)fileState, data, 0, 0);
+ }
+ 
+ /**
+@@ -783,7 +791,16 @@ static void* CardUtilMain(void*)
+ 
+ 		s32 observed; // sub-statement assignment hack for matching
+ 		OSLockMutex(&CardControl.mMutex);
+-		while (TERNARY_BUILD_MATCHING((observed = *channelPtr) == -1, CardUtilIsCardBusy())) {
++		// This is the CONSUMER: it must sleep while there is NOTHING queued.
++		// CardUtilCommand marks work pending by setting mChannel to the
++		// channel (>= 0) and signalling, and CardUtilIsCardBusy() is
++		// "mChannel != -1" — so the non-matching branch here used to wait on
++		// exactly the wrong condition: it slept whenever a command WAS
++		// pending and woke when idle, so queued work was never executed and
++		// any caller of CardUtilIdleWhileBusy() spun forever (hit as a boot
++		// hang in TitlesSection::init once the card actually mounted).
++		// Negated to agree with the matching expression beside it.
++		while (TERNARY_BUILD_MATCHING((observed = *channelPtr) == -1, !CardUtilIsCardBusy())) {
+ 			OSWaitCond(&CardControl.mCondition, &CardControl.mMutex);
+ 		}
+ 
+@@ -842,12 +859,12 @@ static void* CardUtilMain(void*)
+ 		}
+ 		case CARDCMD_Erase:
+ 		{
+-			res = DoErase(chan, (s32)file);
++			res = DoErase(chan, (s32)PC_PTR_TO_U32(file));
+ 			break;
+ 		}
+ 		case CARDCMD_Open:
+ 		{
+-			res = DoOpen(chan, (s32)file, data);
++			res = DoOpen(chan, (s32)PC_PTR_TO_U32(file), data);
+ 			break;
+ 		}
+ 		case CARDCMD_Save:
+@@ -857,13 +874,20 @@ static void* CardUtilMain(void*)
+ 		}
+ 		case CARDCMD_Write:
+ 		{
+-			s32 f   = (s32)file;
++			s32 f   = (s32)PC_PTR_TO_U32(file);
+ 			u32 v   = length;
+ 			void* a = data;
+ 
+ 			res = DoWrite(chan, f, a, v, offset);
+ 			break;
+ 		}
++		// PC probe: an unhandled CARDCMD returns the zero
++		// -ftrivial-auto-var-init leaves in `res`, which is CARD_RESULT_READY —
++		// i.e. a command that did nothing reports success, and mDidSaveFail
++		// stays clear.
++		default:
++			PC_UNINIT_HIT("cardutil.cpp:887 res", cmd);
++			break;
+ 		}
+ 
+ 		// update global objects with results
+@@ -893,6 +917,19 @@ void CardUtilInit(void* stack, u32 stackSize, s32 prio)
+ 	OSInitMutex(&CardControl.mMutex);
+ 	OSInitMutex(&CardControl.mDirMutex);
+ 	OSInitCond(&CardControl.mCondition);
++	// PC: idle is mChannel == -1, but CardControl is a zero-initialised global,
++	// so mChannel starts at 0 — which CardUtilIsCardBusy() reads as BUSY. The
++	// card thread therefore skipped its wait on the first pass and ran one bogus
++	// command with mCommand == 0 (not a CARDCMD; the enum starts at 1), falling
++	// out of the switch with `res` never assigned. Measured by PC_UNINIT_PROBE at
++	// exactly 1 hit per run, every run.
++	//
++	// This is not a behavior change: that pass's only lasting effects were
++	// mResultCode = 0 (already 0 from the zero-init) and mChannel = -1 (what this
++	// line now does directly). Retail had the same zero-init and so ran the same
++	// bogus pass, storing stack residue into mResultCode — which is the part
++	// worth not being faithful to.
++	CardControl.mChannel = -1;
+ 	OSCreateThread(&CardThread.mThread, CardUtilMain, nullptr, stack, stackSize, prio, OS_THREAD_ATTR_DETACH);
+ 	OSResumeThread(&CardThread.mThread);
+ }
+diff --git a/src/plugPikiColin/dayMgr.cpp b/src/plugPikiColin/dayMgr.cpp
+index bd89008..cd59a7e 100644
+--- a/src/plugPikiColin/dayMgr.cpp
++++ b/src/plugPikiColin/dayMgr.cpp
+@@ -908,8 +908,13 @@ void DayMgr::refresh(Graphics& gfx, f32 time, int numLights)
+ 
+ 	// get blending parameters based on time of day
+ 	f32 blendRatio = 0.0f;
+-	TimeSetting* timeSettingStart;
+-	TimeSetting* timeSettingEnd;
++	// PC: the chain below covers every time value — the second branch takes
++	// everything at or past mEveningEnd — but the compiler cannot prove that,
++	// and the two pointers are dereferenced unconditionally afterwards. Default
++	// to the constant daytime setting so a garbled parameter table (or a NaN
++	// time) lights the scene instead of faulting.
++	TimeSetting* timeSettingStart = &mTimeSettings[TIME_Day];
++	TimeSetting* timeSettingEnd   = &mTimeSettings[TIME_Day];
+ 	if (time == MOVIE_TIME) {
+ 		// special movie lighting
+ 		timeSettingStart = timeSettingEnd = &mTimeSettings[TIME_Movie];
+diff --git a/src/plugPikiColin/gameflow.cpp b/src/plugPikiColin/gameflow.cpp
+index e299457..7f44dde 100644
+--- a/src/plugPikiColin/gameflow.cpp
++++ b/src/plugPikiColin/gameflow.cpp
+@@ -69,7 +69,13 @@ void GameLoadIdler::draw(Graphics& gfx)
+ 		return;
+ 	}
+ 
++#if defined(TARGET_PC)
++	// called from pc_loading_tick at ~15 Hz, not GC's ~60 Hz retrace pace;
++	// scale the step to keep the same wall-clock fade-in
++	gameflow.mLevelBannerFadeValue += (4.0f / 300.0f);
++#else
+ 	gameflow.mLevelBannerFadeValue += (1.0f / 300.0f);
++#endif
+ 	if (gameflow.mLevelBannerFadeValue > 1.0f) {
+ 		gameflow.mLevelBannerFadeValue = 1.0f;
+ 	}
+@@ -430,7 +436,7 @@ void GameFlow::read(RandomAccessStream& input)
+  */
+ void preloadLanguage()
+ {
+-	u32 unused;
++	u32 unused = 0;  // PC: fakematch stack padding, never read for a value
+ 	AyuHeap* oldHeap;
+ 	int* lang;
+ 	int heapIdx;
+@@ -512,6 +518,25 @@ void GameFlow::hardReset(BaseApp* baseApp)
+ 
+ 	mCurrGameSectionID      = -1;
+ 	mNextGameSectionID      = SECTION_NinLogo;
++#ifdef TARGET_PC
++	// PC_MOVIE=<0..5>: boot straight into the MovSample section playing one of
++	// the six .h4m movies, rather than NinLogo -> Titles -> ... The tutorial
++	// videos are gated behind in-game events and the two endings behind
++	// completion, so there is otherwise no way to exercise HVQM4 playback on
++	// demand. Dev tool only, same spirit as PC_SKIP_INTRO / PC_WALK.
++	//   0 cntA (grow)   1 cntB (throw)  2 cntC (work)  3 cntD (death)
++	//   4 sr (normal ending)            5 srhp (happy ending)
++	if (const char* pcMovie = getenv("PC_MOVIE")) {
++		int id = atoi(pcMovie);
++		if (id < 0 || id >= MOV_COUNT) {
++			id = 0;
++		}
++		mCurrIntroMovieID  = (u32)id;
++		mNextIntroMovieID  = (u32)id;
++		mNextGameSectionID = SECTION_MovSample;
++		OSReport("[PC] PC_MOVIE=%d -> booting straight into MovSample\n", id);
++	}
++#endif
+ 	mNextOnePlayerSectionID = ONEPLAYER_GameSetup;
+ 	_200                    = 0;            // never used again
+ 	mNextIntroMovieID       = MOV_GrowDemo; // title screen idling movie demo to queue up first
+diff --git a/src/plugPikiColin/mapMgr.cpp b/src/plugPikiColin/mapMgr.cpp
+index 480c49c..bfdb24a 100644
+--- a/src/plugPikiColin/mapMgr.cpp
++++ b/src/plugPikiColin/mapMgr.cpp
+@@ -1612,6 +1612,14 @@ void MapMgr::drawXLU(Graphics& gfx)
+ void MapMgr::postrefresh(Graphics& gfx)
+ {
+ 	if (mMapModel) {
++#ifdef TARGET_PC
++		// One-shot reachability markers for the EFB-copy/blur debug: prove
++		// whether the in-world post pass and its blur block ever run.
++		{
++			static int s_once;
++			if (getenv("PC_VERBOSE") && !s_once++) fprintf(stderr, "[BLUR] postrefresh reached, mToggleBlur=%d\n", (int)gsys->mToggleBlur);
++		}
++#endif
+ 		MATCHING_START_TIMER("mapPost", true);
+ 		mDayMgr->setFog(gfx, nullptr);
+ 
+@@ -1638,6 +1646,12 @@ void MapMgr::postrefresh(Graphics& gfx)
+ 
+ 		// make and draw infamous blur effect - on by default
+ 		if (gsys->mToggleBlur) {
++#ifdef TARGET_PC
++			{
++				static int s_once;
++				if (getenv("PC_VERBOSE") && !s_once++) fprintf(stderr, "[BLUR] blur block ACTIVE (alpha=%.0f)\n", gfx.mCamera ? gfx.mCamera->mBlurAlpha : -1.0f);
++			}
++#endif
+ 			// set up screen environment for drawing
+ 			Matrix4f orthoMtx;
+ 			gfx.setOrthogonal(orthoMtx.mMtx, AREA_FULL_SCREEN(gfx));
+@@ -1665,7 +1679,30 @@ void MapMgr::postrefresh(Graphics& gfx)
+ #endif
+ 
+ 			int blend = gfx.setCBlending(BLEND_MultiTexture);
++#ifdef TARGET_PC
++			// The authentic feedback blur keeps ~alpha/255 (default 110 =
++			// 43%) of the previous frame every frame — tuned for CRT TVs,
++			// and USER-NOTED (2026-07-25) as very heavy / harder to play on
++			// a modern panel. Faithful stays the DEFAULT; PC_BLUR=<percent>
++			// scales the persistence for A/B against Dolphin and as the
++			// basis for a future options-menu setting (100 authentic,
++			// 50 half, 0 off). Applied to the blend alpha only — the
++			// grab/copy machinery still runs identically.
++			f32 pcBlurAlpha = gfx.mCamera->mBlurAlpha;
++			{
++				static int s_blur_pct = -1;
++				if (s_blur_pct < 0) {
++					const char* e = getenv("PC_BLUR");
++					s_blur_pct    = e ? atoi(e) : 100;
++					if (s_blur_pct < 0) s_blur_pct = 0;
++					if (s_blur_pct > 100) s_blur_pct = 100;
++				}
++				pcBlurAlpha = pcBlurAlpha * s_blur_pct / 100.0f;
++			}
++			gfx.setPrimEnv(stack_new(Colour)(255, 255, 255, pcBlurAlpha), nullptr);
++#else
+ 			gfx.setPrimEnv(stack_new(Colour)(255, 255, 255, gfx.mCamera->mBlurAlpha), nullptr);
++#endif
+ 
+ 			// render multi-texture blend (blur)
+ 			gfx.blatRectangle(AREA_FULL_SCREEN(gfx));
+diff --git a/src/plugPikiColin/mapSelect.cpp b/src/plugPikiColin/mapSelect.cpp
+index d5d7675..0b0af60 100644
+--- a/src/plugPikiColin/mapSelect.cpp
++++ b/src/plugPikiColin/mapSelect.cpp
+@@ -124,13 +124,13 @@ public:
+ 				bool valid = gameflow.mGamePrefs.isStageOpen(inf->mChalStageID);
+ 				// must be both open and marked visible in its .ini
+ 				if (inf->mIsVisible && valid) {
+-					mMapListMenu->addOption((int)inf, StdSystem::stringDup(inf->mStageName), nullptr);
++					mMapListMenu->addOption((int)PC_PTR_TO_U32(inf), StdSystem::stringDup(inf->mStageName), nullptr);
+ 				}
+ 			} else {
+ 				bool valid = gameflow.mPlayState.isStageOpen(inf->mStageID);
+ 				// must be open, marked visible in its .ini, and also *not* a challenge mode stage (to avoid dupes)
+ 				if (inf->mIsVisible && valid && inf->mChalStageID == CHALSTAGE_NOT) {
+-					mMapListMenu->addOption((int)inf, StdSystem::stringDup(inf->mStageName), nullptr);
++					mMapListMenu->addOption((int)PC_PTR_TO_U32(inf), StdSystem::stringDup(inf->mStageName), nullptr);
+ 				}
+ 			}
+ 		}
+diff --git a/src/plugPikiColin/movSample.cpp b/src/plugPikiColin/movSample.cpp
+index f794862..1a2018e 100644
+--- a/src/plugPikiColin/movSample.cpp
++++ b/src/plugPikiColin/movSample.cpp
+@@ -10,6 +10,17 @@
+ #include "sysNew.h"
+ #include "system.h"
+ 
++// The UV half of convHVQM4TexY8UV8 composes each texel pair into a u32, which
++// makes the resulting BYTE layout endian-dependent: on GameCube the first
++// shift lands U at byte 0; on a little-endian host it lands V there, so U and
++// V swap and every red reads as blue (the tutorial onion rendered blue). The Y
++// half copies u32 to u32, preserving byte order, so it needs nothing.
++#if defined(TARGET_PC)
++#define PC_TEXW32(x) __builtin_bswap32((u32)(x))
++#else
++#define PC_TEXW32(x) (x)
++#endif
++
+ u16 ImgH;
+ u16 ImgW;
+ GXTexObj YtexObj;
+@@ -89,26 +100,26 @@ void convHVQM4TexY8UV8(int stride, int height, u8* src, u8* dst)
+ 		for (j = stride / 2; j > 0; j -= 4) {
+ 			// two packed pixels per line per iteration
+ 			// Line 0
+-			out[0] = ((u32)u0[0] << 24) | ((u32)v0[0] << 16) | ((u32)u0[1] << 8) | ((u32)v0[1]);
+-			out[1] = ((u32)u0[2] << 24) | ((u32)v0[2] << 16) | ((u32)u0[3] << 8) | ((u32)v0[3]);
++			out[0] = PC_TEXW32(((u32)u0[0] << 24) | ((u32)v0[0] << 16) | ((u32)u0[1] << 8) | ((u32)v0[1]));
++			out[1] = PC_TEXW32(((u32)u0[2] << 24) | ((u32)v0[2] << 16) | ((u32)u0[3] << 8) | ((u32)v0[3]));
+ 			u0 += 4;
+ 			v0 += 4;
+ 
+ 			// Line 1
+-			out[2] = ((u32)u1[0] << 24) | ((u32)v1[0] << 16) | ((u32)u1[1] << 8) | ((u32)v1[1]);
+-			out[3] = ((u32)u1[2] << 24) | ((u32)v1[2] << 16) | ((u32)u1[3] << 8) | ((u32)v1[3]);
++			out[2] = PC_TEXW32(((u32)u1[0] << 24) | ((u32)v1[0] << 16) | ((u32)u1[1] << 8) | ((u32)v1[1]));
++			out[3] = PC_TEXW32(((u32)u1[2] << 24) | ((u32)v1[2] << 16) | ((u32)u1[3] << 8) | ((u32)v1[3]));
+ 			u1 += 4;
+ 			v1 += 4;
+ 
+ 			// Line 2
+-			out[4] = ((u32)u2[0] << 24) | ((u32)v2[0] << 16) | ((u32)u2[1] << 8) | ((u32)v2[1]);
+-			out[5] = ((u32)u2[2] << 24) | ((u32)v2[2] << 16) | ((u32)u2[3] << 8) | ((u32)v2[3]);
++			out[4] = PC_TEXW32(((u32)u2[0] << 24) | ((u32)v2[0] << 16) | ((u32)u2[1] << 8) | ((u32)v2[1]));
++			out[5] = PC_TEXW32(((u32)u2[2] << 24) | ((u32)v2[2] << 16) | ((u32)u2[3] << 8) | ((u32)v2[3]));
+ 			u2 += 4;
+ 			v2 += 4;
+ 
+ 			// Line 3
+-			out[6] = ((u32)u3[0] << 24) | ((u32)v3[0] << 16) | ((u32)u3[1] << 8) | ((u32)v3[1]);
+-			out[7] = ((u32)u3[2] << 24) | ((u32)v3[2] << 16) | ((u32)u3[3] << 8) | ((u32)v3[3]);
++			out[6] = PC_TEXW32(((u32)u3[0] << 24) | ((u32)v3[0] << 16) | ((u32)u3[1] << 8) | ((u32)v3[1]));
++			out[7] = PC_TEXW32(((u32)u3[2] << 24) | ((u32)v3[2] << 16) | ((u32)u3[3] << 8) | ((u32)v3[3]));
+ 			u3 += 4;
+ 			v3 += 4;
+ 
+@@ -136,6 +147,16 @@ void convHVQM4TexY8UV8(int stride, int height, u8* src, u8* dst)
+ static void* playbackFunc(void*)
+ {
+ 	while (!finishPlayback) {
++#if defined(TARGET_PC)
++		// PC: MovSampleSection::update() stops this thread with OSCancelThread
++		// and then calls softReset(), which resets the heap and allocates a new
++		// app stack over the HVQM workspace this loop decodes into. Our
++		// OSCancelThread is cooperative, so the thread has to leave here of its
++		// own accord before the section change proceeds.
++		if (pc_thread_cancel_requested()) {
++			break;
++		}
++#endif
+ 		Jac_StreamMovieUpdate();
+ 	}
+ 	return nullptr;
+@@ -191,6 +212,67 @@ struct MovSampleSetupSection : public Node {
+ 			pic = Jac_StreamMovieGetPicture(&a, &b, &c);
+ 		}
+ 
++#if defined(TARGET_PC)
++		// PC_MOVIE_TRACE=1: are pictures actually reaching the section? Counts
++		// delivered frames and reports the decoded dimensions.
++		if (getenv("PC_MOVIE_TRACE")) {
++			static int nPics, nCalls, lastB, lastC;
++			nCalls++;
++			// Census -Wconditional-uninitialized (`b`, `c`): AUDITED NON-BUG.
++			// Both are written only by Jac_StreamMovieGetPicture, which is also
++			// the only thing that can make `a` non-null (it is initialised to
++			// nullptr above). So `a &&` is an exact test for "the call ran", and
++			// the reads below cannot see an unassigned b/c. Correlated guard.
++			if (a && pic) {
++				nPics++;
++				lastB = b;
++				lastC = c;
++			}
++			if ((nCalls % 60) == 0) {
++				fprintf(stderr, "[MOVIE] %d/%d update()s delivered a picture, last %dx%d, pic=%d\n", nPics, nCalls,
++				        lastB, lastC, pic);
++			}
++		}
++#endif
++#if defined(TARGET_PC)
++		// PC_MOVIE_DUMP=<path>: write one delivered picture as a PPM so the
++		// decode can be checked visually. Counters only prove frames ARRIVE; a
++		// partly-wrong bitstream decode still produces plausible counters (the
++		// AFC audio did exactly that). The decoded picture is planar YUV420:
++		// Y[w*h], then U[(w/2)*(h/2)], then V.
++		if (a && pic && getenv("PC_MOVIE_DUMP")) {
++			static int seen;
++			++seen;
++			if (seen >= 90 && seen < 98) { // a run of consecutive delivered frames
++				const int w = b, h = c;
++				const u8* Y = a;
++				const u8* U = a + w * h;
++				const u8* V = U + (w / 2) * (h / 2);
++				char path[512];
++				snprintf(path, sizeof(path), "%s.%02d.ppm", getenv("PC_MOVIE_DUMP"), seen - 90);
++				FILE* f = fopen(path, "wb");
++				if (f) {
++					fprintf(f, "P6\n%d %d\n255\n", w, h);
++					for (int yy = 0; yy < h; yy++) {
++						for (int xx = 0; xx < w; xx++) {
++							const int yv = Y[yy * w + xx];
++							const int uv = U[(yy / 2) * (w / 2) + (xx / 2)] - 128;
++							const int vv = V[(yy / 2) * (w / 2) + (xx / 2)] - 128;
++							int r  = yv + ((91881 * vv) >> 16);
++							int g  = yv - ((22554 * uv + 46802 * vv) >> 16);
++							int bl = yv + ((116130 * uv) >> 16);
++							r  = r < 0 ? 0 : (r > 255 ? 255 : r);
++							g  = g < 0 ? 0 : (g > 255 ? 255 : g);
++							bl = bl < 0 ? 0 : (bl > 255 ? 255 : bl);
++							fputc(r, f); fputc(g, f); fputc(bl, f);
++						}
++					}
++					fclose(f);
++					fprintf(stderr, "[MOVIE] dumped delivered frame %d (pic=%d) -> %s\n", seen - 90, pic, path);
++				}
++			}
++		}
++#endif
+ 		if (a && pic) {
+ #if defined(VERSION_GPIJ01) || defined(VERSION_DPIJ01_PIKIDEMO)
+ 			convHVQM4TexY8UV8(b, c, a, _48[_3C]);
+@@ -205,6 +287,12 @@ struct MovSampleSetupSection : public Node {
+ 			check = true;
+ 		}
+ 
++#if defined(TARGET_PC)
++		if (check || pic == -1) {
++			fprintf(stderr, "[MOVIE] ENDING: check=%d (keyClick) pic=%d — %s\n", check ? 1 : 0, pic,
++			        check ? "input skipped the movie" : "stream reported end/failure");
++		}
++#endif
+ 		if (check || pic == -1) {
+ 			Jac_StreamMovieStop();
+ 			OSCancelThread(&playbackThread);
+@@ -280,6 +368,26 @@ struct MovSampleSetupSection : public Node {
+ 		GXSetTevSwapModeTable(GX_TEV_SWAP2, GX_CH_RED, GX_CH_RED, GX_CH_ALPHA, GX_CH_RED);
+ 
+ 		u8* data = _48[_3C];
++#if defined(TARGET_PC)
++		if (getenv("PC_MOVIE_TRACE")) {
++			static int t;
++			if ((t++ % 120) == 0) {
++				const u8* Y  = data;
++				const u8* UV = &data[ImgW * ImgH];
++				int ymin = 255, ymax = 0, umin = 255, umax = 0;
++				for (int i = 0; i < ImgW * ImgH; i += 977) {
++					if (Y[i] < ymin) ymin = Y[i];
++					if (Y[i] > ymax) ymax = Y[i];
++				}
++				for (int i = 0; i < (ImgW / 2) * (ImgH / 2) * 2; i += 811) {
++					if (UV[i] < umin) umin = UV[i];
++					if (UV[i] > umax) umax = UV[i];
++				}
++				fprintf(stderr, "[TEXDATA] buf=%d Y range %d..%d  UV range %d..%d  ptr=%p\n", _3C, ymin, ymax, umin,
++				        umax, (void*)data);
++			}
++		}
++#endif
+ 		GXInitTexObj(&YtexObj, data, ImgW, ImgH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+ 		GXInitTexObjLOD(&YtexObj, GX_NEAR, GX_NEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_FALSE, GX_ANISO_1);
+ 		GXLoadTexObj(&YtexObj, GX_TEXMAP1);
+diff --git a/src/plugPikiColin/moviePlayer.cpp b/src/plugPikiColin/moviePlayer.cpp
+index 98c2060..d168008 100644
+--- a/src/plugPikiColin/moviePlayer.cpp
++++ b/src/plugPikiColin/moviePlayer.cpp
+@@ -1,4 +1,5 @@
+ #include "MoviePlayer.h"
++#include "pc_uninit.h"
+ #include "DebugLog.h"
+ #include "EffectMgr.h"
+ #include "FlowController.h"
+@@ -217,7 +218,16 @@ void MoviePlayer::initMovie(MovieInfo* info, int)
+ 	bool old             = gsys->mPrevAllocType; // BOOL -> bool conversion required for regalloc lol.
+ 	gsys->mPrevAllocType = FALSE;
+ 	int heapid           = gsys->getHeapNum();
+-	int type;
++	// PC: a legal value rather than an indeterminate one. This is only ever read
++	// on the path where it was NOT assigned (the two conditions here are exact
++	// complements — see the note at the restore below), so it is always the
++	// initialiser that reaches setAllocType. GROW_DOWN is the right name for it:
++	// mAllocType's only consumers test `& AYU_STACK_GROW_UP` or
++	// `== AYU_STACK_GROW_UP` (ayuStack.cpp:66/123/163), and 0 — what
++	// -ftrivial-auto-var-init=zero supplies today — fails all three exactly as
++	// GROW_DOWN(1) does. So this renames the existing behavior, it does not
++	// change it. Measured by PC_UNINIT_PROBE at 1 hit, heapid=5 (SYSHEAP_Movie).
++	int type             = AYU_STACK_GROW_DOWN;
+ 	if (heapid == SYSHEAP_App) {
+ 		PRINT("using movie heap!\n");
+ 		gsys->setHeap(SYSHEAP_Movie);
+@@ -230,7 +240,16 @@ void MoviePlayer::initMovie(MovieInfo* info, int)
+ 	}
+ 
+ 	// This has got to be a bug, right?  TODO: Test what side-effects this has.
++	//
++	// PC probe — and yes, it is. Census -Wconditional-uninitialized (`type`):
++	// `type` is assigned under `heapid == SYSHEAP_App` and read under
++	// `heapid != SYSHEAP_App`. The two conditions are exact complements, so this
++	// site reads an uninitialized `type` EVERY time it is reached, and never
++	// reads an initialized one. On PC that restores AllocType 0; on GameCube it
++	// restored whatever the stack held. Faithful-first says measure how often
++	// this runs before deciding what it should have been.
+ 	if (heapid != SYSHEAP_App) {
++		PC_UNINIT_HIT("moviePlayer.cpp:234 type", heapid);
+ 		gsys->getHeap(SYSHEAP_Movie)->setAllocType(type);
+ 		gsys->setHeap(heapid);
+ 	}
+@@ -629,6 +648,41 @@ void MoviePlayer::update()
+ 		return;
+ 	}
+ 
++#ifdef TARGET_PC
++	// PC_SKIP_INTRO=1: fast-forward the unskippable opening cutscene chain
++	// (cinemas/demo01 -> demo02) straight into day-1 gameplay, via the
++	// engine's own SkipAll path. Dev tool for verifying in-world scenes
++	// without sitting through ~150s of intro at capture-load framerate.
++	if (getenv("PC_SKIP_INTRO") && mIsActive) {
++		MovieInfo* h = static_cast<MovieInfo*>(mPlayInfoList.mChild);
++		if (h && h->mName && strncmp(h->mName, "cinemas/demo0", 13) == 0) {
++			static int s_skipped;
++			if (!s_skipped && h->mPlayer && h->mPlayer->mCurrentPlaybackTime >= 3.0f) {
++				s_skipped = 1;
++				fprintf(stderr, "[DEMO] PC_SKIP_INTRO: SkipAll on '%s'\n", h->mName);
++				skipScene(SCENESKIP_SkipAll);
++			}
++		}
++	}
++	if (getenv("PC_DEMO_TRACE")) {
++		static int s_dt;
++		if ((s_dt++ % 60) == 0) {
++			int n = mPlayInfoList.getChildCount();
++			MovieInfo* head = static_cast<MovieInfo*>(mPlayInfoList.mChild);
++			if (head && head->mPlayer) {
++				CinematicPlayer* p = head->mPlayer;
++				fprintf(stderr, "[DEMO] active=%d nMovies=%d stack=%d head='%s' t=%.1f/%d skip=%d mode=%d playing=%d scene=%p\n",
++				        mIsActive ? 1 : 0, n, mStackInfoList.getChildCount(), head->mName,
++				        p->mCurrentPlaybackTime, p->mTotalDuration, p->mSceneSkipFlag, p->mPlaybackMode,
++				        p->mIsPlaying ? 1 : 0, (void*)p->mCurrentScene);
++			} else {
++				fprintf(stderr, "[DEMO] active=%d nMovies=%d stack=%d (no head)\n",
++				        mIsActive ? 1 : 0, n, mStackInfoList.getChildCount());
++			}
++		}
++	}
++#endif
++
+ 	if (mIsActive && mIsPaused && static_cast<MovieInfo*>(mPlayInfoList.mChild)->mPlayer->mCurrentPlaybackTime > 0.0f) {
+ 		static_cast<MovieInfo*>(mPlayInfoList.mChild)->mPlayer->mCurrentPlaybackTime -= 1.0f;
+ 	}
+diff --git a/src/plugPikiColin/newPikiGame.cpp b/src/plugPikiColin/newPikiGame.cpp
+index c3acc4b..4d36b3c 100644
+--- a/src/plugPikiColin/newPikiGame.cpp
++++ b/src/plugPikiColin/newPikiGame.cpp
+@@ -65,7 +65,30 @@ class NewPikiGameSetupSection;
+ #define TEKI_HEAP_SIZE (0xA00000)
+ #else
+ /// Size of the "teki" heap to use for gameplay (and some cutscenes).
+-#define TEKI_HEAP_SIZE (0x280000)
++// PC: was the GameCube 0x280000 (2.5 MB), and day 5 exhausts it during
++// GameCoreSection::initStage — measured, not guessed:
++//
++//     [PC] ALLOC FAIL 12 bytes in heap 'teki' (size=2621440 used=2621424)
++//
++// in BossMgr::constructBoss -> BossShapeObject -> AnimMgr -> Stream::readString.
++//
++// With room to spare, day 5 settles at 2730672 bytes — it wanted just 109232
++// more than the console's budget, 4% over. So this is a MARGINAL overshoot, not
++// a doubling: retail must have run this heap close to full, and a modest
++// per-object growth on LP64 is enough to tip it. Do not read it as "LP64
++// doubles everything"; the measurement does not support that, and the exact
++// mechanism is not diagnosed.
++//
++// It surfaced only now because v94's genBoss fix stopped every generator
++// reporting boss 0 — day 5 finally constructs its real bosses instead of one
++// shared Beady Long Legs. A correctness fix uncovering a budget that was always
++// too tight, rather than a new fault.
++//
++// The retail source already concedes the point directly above: a non-GameCube
++// build gets 0xA00000, "bigger in the DLL". Taking the same value rather than
++// inventing one, since it is the shipped precedent for exactly this situation.
++// PC_HEAPDIAG=1 reports what each heap actually holds after a stage loads.
++#define TEKI_HEAP_SIZE (0xA00000)
+ #endif
+ 
+ /// Size of the "movie" heap to use for gameplay, cutscenes, and some menus/windows.
+@@ -781,6 +804,32 @@ void BaseGameSection::draw(Graphics& gfx)
+ 		}
+ 	}
+ 
++#if defined(TARGET_PC)
++	// GC's DVD loads gave seconds of BLACK + course title card before the
++	// world fade-in began; an SSD load collapses that to nothing, so the card
++	// cross-faded WITH the world fade-in (user-verified wrong). Arm the card
++	// at full alpha if the load ended before GameLoadIdler ever drew (its
++	// fade still at setBannerTex's 0.0 init), then HOLD black + card before
++	// releasing the two authentic ramps (banner out 1 s, world in 2 s).
++	// PC_BANNER_HOLD=<seconds> tunes the hold (default 2), PC_NO_BANNER=1
++	// disables the arm entirely.
++	static f32 sBannerHold;
++	if (gameflow.mLevelBannerTex && gameflow.mLevelBannerFadeValue <= 0.0f) {
++		static int noBanner = -1;
++		if (noBanner < 0) {
++			noBanner = getenv("PC_NO_BANNER") ? 1 : 0;
++		}
++		if (!noBanner) {
++			gameflow.mLevelBannerFadeValue = 1.0f;
++			sBannerHold = getenv("PC_BANNER_HOLD") ? (f32)atof(getenv("PC_BANNER_HOLD")) : 2.0f;
++		}
++	}
++	if (sBannerHold > 0.0f && gameflow.mLevelBannerTex) {
++		sBannerHold -= gsys->getFrameTime();
++		mCurrentFade = 0.0f; // keep the world fully black under the card
++	}
++#endif
++
+ 	// draw fade overlay, if active
+ 	if (mCurrentFade < 1.0f) {
+ 		f32 fade = mCurrentFade;
+@@ -797,13 +846,21 @@ void BaseGameSection::draw(Graphics& gfx)
+ 
+ 	// draw level banner, if active
+ 	if (gameflow.mLevelBannerTex && gameflow.mLevelBannerFadeValue > 0.0f) {
+-		// fade out level banner
+-		gameflow.mLevelBannerFadeValue -= gsys->getFrameTime();
+-		if (gameflow.mLevelBannerFadeValue < 0.0f) {
+-			gameflow.mLevelBannerTex       = nullptr;
+-			gameflow.mLevelBannerFadeValue = 0.0f;
+-		} else {
++#if defined(TARGET_PC)
++		if (sBannerHold > 0.0f) {
++			// still in the hold: card at full alpha, no fade-out yet
+ 			gameflow.drawLoadLogo(gfx, false, gameflow.mLevelBannerTex, gameflow.mLevelBannerFadeValue);
++		} else
++#endif
++		{
++			// fade out level banner
++			gameflow.mLevelBannerFadeValue -= gsys->getFrameTime();
++			if (gameflow.mLevelBannerFadeValue < 0.0f) {
++				gameflow.mLevelBannerTex       = nullptr;
++				gameflow.mLevelBannerFadeValue = 0.0f;
++			} else {
++				gameflow.drawLoadLogo(gfx, false, gameflow.mLevelBannerTex, gameflow.mLevelBannerFadeValue);
++			}
+ 		}
+ 	}
+ 
+diff --git a/src/plugPikiColin/ninLogo.cpp b/src/plugPikiColin/ninLogo.cpp
+index 56e7910..b381bc0 100644
+--- a/src/plugPikiColin/ninLogo.cpp
++++ b/src/plugPikiColin/ninLogo.cpp
+@@ -83,6 +83,29 @@ struct NinLogoSetupSection : public Node {
+ 				return;
+ 			}
+ 		} else {
++#if defined(TARGET_PC)
++			// GC held the Nintendo logo over black for the whole boot load
++			// (seconds of DVD reads); a PC boot is instant and transits after
++			// ~one frame, flashing the logo. Delay the transit instead — this
++			// section's draw keeps showing the logo (mLevelBannerTex is still
++			// live here; it's TitleSection init that nulls it). Approximate
++			// wall-clock, not authored timing. PC_LOGO_HOLD=<seconds>
++			// (default 2, 0 disables).
++			// NOTE: a boot hang that LOOKED like this hold (logo on screen
++			// forever, 2026-07-26) was really CardUtilIdleWhileBusy spinning
++			// in TitlesSection::init — this countdown was cleared by the
++			// stackshot. Keep that in mind before suspecting it again.
++			static f32 sHold  = 0.0f;
++			static int sArmed = 0;
++			if (!sArmed) {
++				sArmed = 1;
++				sHold  = getenv("PC_LOGO_HOLD") ? (f32)atof(getenv("PC_LOGO_HOLD")) : 2.0f;
++			}
++			if (sHold > 0.0f) {
++				sHold -= gsys->getFrameTime();
++				return;
++			}
++#endif
+ 			// transit to title once progressive mode window is complete
+ 			gameflow.mNextGameSectionID = SECTION_Titles;
+ 			gsys->softReset();
+diff --git a/src/plugPikiColin/parameters.cpp b/src/plugPikiColin/parameters.cpp
+index 5b919c7..b465885 100644
+--- a/src/plugPikiColin/parameters.cpp
++++ b/src/plugPikiColin/parameters.cpp
+@@ -122,6 +122,7 @@ void Parameters::read(RandomAccessStream& input)
+ 
+ 	while (true) {
+ 		int entryHeader = input.readInt();
++		if (getenv("PC_VERBOSE")) fprintf(stderr, "[Prms] hdr=%08x pos=%d pending=%d\n", entryHeader, input.getPosition(), input.getPending()); /* PC probe: strip */
+ 		if (entryHeader == FILE_TERMINATOR) {
+ 			// end of file reached
+ 			break;
+diff --git a/src/plugPikiColin/titles.cpp b/src/plugPikiColin/titles.cpp
+index b71335d..4b0c078 100644
+--- a/src/plugPikiColin/titles.cpp
++++ b/src/plugPikiColin/titles.cpp
+@@ -676,6 +676,8 @@ public:
+ 		}
+ 
+ 		// i do not know what load banner we'd have here but draw it just in case
++		// (note: TitleSection init NULLS mLevelBannerTex, so on the boot path
++		// this decrements a null-tex fade — it never draws the Nintendo logo)
+ 		if (gameflow.mLevelBannerFadeValue > 0.0f) {
+ 			gameflow.mLevelBannerFadeValue -= gsys->getFrameTime();
+ 			if (gameflow.mLevelBannerFadeValue < 0.0f) {
+diff --git a/src/plugPikiKando/aiBridge.cpp b/src/plugPikiKando/aiBridge.cpp
+index 96115d3..ea045ce 100644
+--- a/src/plugPikiKando/aiBridge.cpp
++++ b/src/plugPikiKando/aiBridge.cpp
+@@ -295,7 +295,7 @@ void ActBridge::initGo()
+  */
+ int ActBridge::exeGo()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+@@ -313,7 +313,7 @@ void ActBridge::initWork()
+  */
+ int ActBridge::exeWork()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+diff --git a/src/plugPikiKando/aiPut.cpp b/src/plugPikiKando/aiPut.cpp
+index f76f8ff..cbaa964 100644
+--- a/src/plugPikiKando/aiPut.cpp
++++ b/src/plugPikiKando/aiPut.cpp
+@@ -519,6 +519,12 @@ void ActPutItem::findPos()
+ 				Creature* item = *iter;
+ 				Vector3f dir   = item->mSRT.t - mItem.getPtr()->mSRT.t;
+ 				f32 dist       = dir.length();
++				// Census -Wconditional-uninitialized (`lastDist`): AUDITED
++				// NON-BUG. `lastDist` is assigned on every iteration of the
++				// FIRST CI_LOOP, and `closestItem` is assigned only inside that
++				// same loop — so the enclosing `if (closestItem)` is an exact
++				// test for "the first loop ran at least once", which is exactly
++				// what assigning lastDist requires. Correlated guard.
+ 				if (dist <= minDist && dist >= lastDist) {
+ 					closestItem = item;
+ 					minDist     = dist;
+diff --git a/src/plugPikiKando/creature.cpp b/src/plugPikiKando/creature.cpp
+index ea73432..6ea9ba0 100644
+--- a/src/plugPikiKando/creature.cpp
++++ b/src/plugPikiKando/creature.cpp
+@@ -938,7 +938,10 @@ void Creature::collisionCheck(f32 _unused)
+ 		return;
+ 	}
+ 
+-	Iterator iter(&mSearchBuffer, stack_new(CndIsAtari)());
++	// PC: stack_new temporary stored in `iter`, which outlives the statement —
++	// see docs/ARCHITECTURE.md work list E. Named so its lifetime matches.
++	CndIsAtari isAtari;
++	Iterator iter(&mSearchBuffer, &isAtari);
+ 	CI_LOOP(iter)
+ 	{
+ 		Creature* collider = *iter;
+diff --git a/src/plugPikiKando/gameCoreSection.cpp b/src/plugPikiKando/gameCoreSection.cpp
+index cecde5a..b58d3d8 100644
+--- a/src/plugPikiKando/gameCoreSection.cpp
++++ b/src/plugPikiKando/gameCoreSection.cpp
+@@ -1,5 +1,7 @@
+ #include "GameCoreSection.h"
+ 
++extern "C" void pc_heap_report(void); // PC: sysNew.cpp — PC_HEAPDIAG at-exit peaks
++
+ #include "AIConstant.h"
+ #include "AIPerf.h"
+ #include "BombItem.h"
+@@ -1186,6 +1188,33 @@ void GameCoreSection::initStage()
+ 
+ 	naviMgr->getNavi(0)->startKontroller();
+ 	PRINT("init stage done\n");
++
++	// PC: PC_HEAPDIAG=1 — what each heap actually holds once a stage is fully
++	// built, which is where 'teki' peaks (every enemy and boss model plus their
++	// animations are loaded by now). Reported here because a heap that fails
++	// reports only the CLAMPED figure: 'teki' read 2621424 of 2621440 on day 5
++	// whether it was over by 12 bytes or by a megabyte, and that number cannot
++	// size anything. Same lesson as the render caps in v93-v95 — measure the
++	// demand with room to spare, then size against it.
++	if (getenv("PC_HEAPDIAG")) {
++		// Also report at exit, once. Registered here rather than at startup so
++		// gsys is known good; the handler guards it anyway.
++		static bool registered = false;
++		if (!registered) {
++			registered = true;
++			atexit(pc_heap_report);
++		}
++		for (int h = 0; h < SYSHEAP_COUNT; h++) {
++			AyuHeap* q = &gsys->mHeaps[h];
++			if (!q->mSize) continue;
++			// PEAK is the number that sizes a heap; `used` is only what happened
++			// to be live at this instant. They diverge most on the transient
++			// heaps ('load'), which is exactly where reading the sample misleads.
++			fprintf(stderr, "[HEAP] %-8s peak %8d / %8d (%5.1f%%)   used %8d (%5.1f%%) after initStage\n",
++			        q->mName ? q->mName : "?", q->getPeak(), q->mSize, 100.0 * q->getPeak() / q->mSize,
++			        q->mTotalSize, 100.0 * q->mTotalSize / q->mSize);
++		}
++	}
+ }
+ 
+ /**
+diff --git a/src/plugPikiKando/gameStat.cpp b/src/plugPikiKando/gameStat.cpp
+index bc327db..f530c1d 100644
+--- a/src/plugPikiKando/gameStat.cpp
++++ b/src/plugPikiKando/gameStat.cpp
+@@ -93,7 +93,7 @@ void GameStat::Counter::dump(immut char* name)
+  */
+ void GameStat::ColCounter::dump(immut char* name)
+ {
+-	PRINT("<%s> %d (%d + %d + %d)\n", name, int(mCounts), mCounts[Blue], mCounts[Red], mCounts[Yellow]);
++	PRINT("<%s> %d (%d + %d + %d)\n", name, (int)PC_PTR_TO_U32(mCounts), mCounts[Blue], mCounts[Red], mCounts[Yellow]);
+ }
+ 
+ /**
+diff --git a/src/plugPikiKando/generator.cpp b/src/plugPikiKando/generator.cpp
+index d7e0c7a..a450957 100644
+--- a/src/plugPikiKando/generator.cpp
++++ b/src/plugPikiKando/generator.cpp
+@@ -1,4 +1,5 @@
+ #include "Generator.h"
++#include <stdlib.h>
+ #include "Age.h"
+ #include "DebugLog.h"
+ #include "GameStat.h"
+@@ -40,12 +41,17 @@ GeneratorList* generatorList;
+  */
+ static void writeID(RandomAccessStream& output, u32 id)
+ {
+-	u8* outID = reinterpret_cast<u8*>(&id);
+-
+-	output.writeByte(outID[3]);
+-	output.writeByte(outID[2]);
+-	output.writeByte(outID[1]);
+-	output.writeByte(outID[0]);
++	/* PC: mirror the portable readID below. The GC wrote `((u8*)&id)[3..0]`,
++	   which on a big-endian host emits the LEAST significant byte of `id`
++	   first. The raw overlay reverses that on little-endian, so every 4CC
++	   written here came back byte-swapped through readID: the genObject /
++	   genArea / genType factory lookups in Generator::read all missed, their
++	   doRead()/parameter blocks were skipped, and the ram generator cache
++	   desynced. See ID32::write, which had the same fix. */
++	output.writeByte((u8)(id & 0xFF));
++	output.writeByte((u8)((id >> 8) & 0xFF));
++	output.writeByte((u8)((id >> 16) & 0xFF));
++	output.writeByte((u8)((id >> 24) & 0xFF));
+ }
+ 
+ /**
+@@ -54,13 +60,14 @@ static void writeID(RandomAccessStream& output, u32 id)
+  */
+ static u32 readID(RandomAccessStream& input)
+ {
+-	u32 outID;
+-	u8* id = reinterpret_cast<u8*>(&outID);
+-	id[3]  = input.readByte();
+-	id[2]  = input.readByte();
+-	id[1]  = input.readByte();
+-	id[0]  = input.readByte();
+-	return outID;
++	/* PC: portable big-endian compose — see ID32::read. The raw `(u8*)&outID`
++	   overlay byte-swapped every genObject/area/type 4CC on little-endian, so
++	   the factory lookups all missed and the stream desynced. */
++	u8 b0 = input.readByte();
++	u8 b1 = input.readByte();
++	u8 b2 = input.readByte();
++	u8 b3 = input.readByte();
++	return ((u32)b3 << 24) | ((u32)b2 << 16) | ((u32)b1 << 8) | (u32)b0;
+ }
+ 
+ /**
+@@ -591,6 +598,36 @@ void Generator::init()
+ 	}
+ 
+ 	if (ramMode && (mCarryOverFlags & GENCARRY_SaveSpawnCount)) {
++#if defined(TARGET_PC)
++		// PC_GEN_TRACE=1: why a generator decided to respawn. Chasing "a boss
++		// spawns on day 3/4 where the retail game spawns none, twice, the second
++		// in the wrong place".
++		//
++		// The gate is `currentDay >= mLatestSpawnDay + mRespawnInterval`, and
++		// mRespawnInterval is written ONLY by read() (generator.cpp:743) — there
++		// is no initialiser for it anywhere in the tree, and operator new does not
++		// zero (sysDolphin/sysNew.cpp:81 just carves the arena). In this ramMode
++		// path read() has run, so it should be the saved value; the point of this
++		// trace is to confirm that rather than assume it.
++		//
++		// Note the save side writes getRebirthDay() where the load side reads
++		// mRespawnInterval (generator.cpp:830 vs :743) — same width, different
++		// source, so a mismatch would show up here as an interval that is not
++		// what the generator was using before the save.
++		{
++			static int gt = -1;
++			if (gt < 0) {
++				gt = getenv("PC_GEN_TRACE") ? 1 : 0;
++			}
++			if (gt) {
++				OSReport("[GEN] type=%08x obj=%08x day=%d lastSpawn=%d interval=%d rebirth=%d limit=%d alive=%d -> %s\n",
++				         mGenTypeID, mGenObjectID, gameflow.mWorldClock.mCurrentDay, mLatestSpawnDay,
++				         mRespawnInterval, getRebirthDay(), mDayLimit, mAliveCount,
++				         (gameflow.mWorldClock.mCurrentDay >= mLatestSpawnDay + mRespawnInterval) ? "RESPAWN FRESH"
++				                                                                                 : "restore count");
++			}
++		}
++#endif
+ 		if (gameflow.mWorldClock.mCurrentDay >= mLatestSpawnDay + mRespawnInterval) {
+ 			// we're due to respawn afresh.
+ 			PRINT("****** RESET DAY (curr=%d / save=%d interval=%d)\n", gameflow.mWorldClock.mCurrentDay, mLatestSpawnDay,
+diff --git a/src/plugPikiKando/generatorCache.cpp b/src/plugPikiKando/generatorCache.cpp
+index b5fe347..9c0a085 100644
+--- a/src/plugPikiKando/generatorCache.cpp
++++ b/src/plugPikiKando/generatorCache.cpp
+@@ -287,7 +287,7 @@ bool GeneratorCache::hasUfoParts(u32 stageID, u32 ufoPartIdx)
+ {
+ 	Cache* cache = findCache(mAliveCacheList, stageID);
+ 	if (cache) {
+-		void* heap = (void*)(((u32)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize) + cache->mCreatureCacheSize);
++		void* heap = (void*)(((uintptr_t)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize) + cache->mCreatureCacheSize);
+ 		RamStream stream(heap, cache->mUfoPartsCacheSize);
+ 		for (int i = 0; i < cache->mUfoPartsCount; i++) {
+ 			int thisPartIdx = stream.readInt();
+@@ -319,7 +319,7 @@ void GeneratorCache::load(u32 stageID)
+ 	PRINT("cahce = %x\n", cache);
+ 	if (cache) {
+ 		PRINT("cache = %x\n", cache);
+-		void* heap = (void*)(((u32)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize));
++		void* heap = (void*)(((uintptr_t)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize));
+ 		PRINT("load from %x : %d creatures\n", heap, cache->mCreatureCount);
+ 		RamStream stream(heap, cache->mCreatureCacheSize);
+ 		for (int i = 0; i < cache->mCreatureCount; i++) {
+@@ -332,6 +332,20 @@ void GeneratorCache::load(u32 stageID)
+ 				PRINT("*******************************************************************\n");
+ 				PRINT("\tno generator : genNo = %d\n", genNum);
+ 				ERROR("why?\n");
++				/* PC: on GC, ERROR() -> System::halt -> OSErrorLine stops the
++				   console, so control never reaches the deref below. Our halt
++				   shim returns, and the original code then walks straight into
++				   `gen->loadCreature()` on a null pointer. A missing generator
++				   only happens when the creature stream has desynced (e.g. a
++				   cache written by an older build), and everything after this
++				   point in the stream is garbage, so abandon the rest of the
++				   creature block rather than segfaulting. The ufo-parts block
++				   below is addressed independently off the Cache header and is
++				   still valid. */
++				fprintf(stderr, "[PC] genCache: stale/desynced creature cache for stage %d "
++				                "(record %d/%d, genNo=%d) - dropping remaining creatures\n",
++				        stageID, i, cache->mCreatureCount, genNum);
++				break;
+ 			}
+ 
+ 			gen->loadCreature(stream);
+@@ -426,9 +440,9 @@ void GeneratorCache::saveGenerator(Generator* gen)
+ 			ERROR("currID(%d) is broken !\n", mCurrentSaveCacheIdx);
+ 		}
+ 
+-		void* heap = (void*)(((u32)mCacheHeap + mUsedSize));
++		void* heap = (void*)(((uintptr_t)mCacheHeap + mUsedSize));
+ 		RamStream stream(heap, mFreeSize);
+-		PRINT("ramStream :%08x - %08x (%.2fK free)\n", (u32)heap, (u32)heap + mFreeSize, mFreeSize / 1024.0f);
++		PRINT("ramStream :%08x - %08x (%.2fK free)\n", PC_PTR_TO_U32(heap), PC_PTR_TO_U32(heap) + mFreeSize, mFreeSize / 1024.0f);
+ 
+ 		Generator::ramMode     = true;
+ 		gen->mGeneratorListIdx = cache->mGenCount;
+@@ -462,7 +476,7 @@ void GeneratorCache::prepareUfoParts(GeneratorCache::Cache* cache)
+ {
+ 	PRINT("prepare ufo parts ** %d\n", cache->mUfoPartsCount);
+ 
+-	void* heap = (void*)(((u32)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize) + cache->mCreatureCacheSize);
++	void* heap = (void*)(((uintptr_t)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize) + cache->mCreatureCacheSize);
+ 	RamStream stream(heap, cache->mUfoPartsCacheSize);
+ 
+ 	for (int i = 0; i < cache->mUfoPartsCount; i++) {
+@@ -493,8 +507,8 @@ void GeneratorCache::prepareUfoParts(GeneratorCache::Cache* cache)
+  */
+ void GeneratorCache::loadUfoParts(GeneratorCache::Cache* cache)
+ {
+-	void* heap = (void*)(((u32)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize) + cache->mCreatureCacheSize);
+-	PRINT("load from %x : %d ufo parts\n", (u32)heap, cache->mUfoPartsCount);
++	void* heap = (void*)(((uintptr_t)mCacheHeap + cache->mCacheHeapOffset + cache->mGenCacheSize) + cache->mCreatureCacheSize);
++	PRINT("load from %x : %d ufo parts\n", PC_PTR_TO_U32(heap), cache->mUfoPartsCount);
+ 	RamStream stream(heap, cache->mUfoPartsCacheSize);
+ 	PRINT("********* LOAD UFO PARTS (%d)*************************\n", cache->mUfoPartsCount);
+ 
+@@ -524,7 +538,7 @@ void GeneratorCache::saveUfoParts(Pellet* part)
+ 		ERROR("currID(%d) is broken !\n", mCurrentSaveCacheIdx);
+ 	}
+ 
+-	void* heap = (void*)(((u32)mCacheHeap + mUsedSize));
++	void* heap = (void*)(((uintptr_t)mCacheHeap + mUsedSize));
+ 	RamStream stream(heap, mFreeSize);
+ 	stream.writeInt(part->mConfig->mModelId.mId);
+ 	part->save(stream, true);
+@@ -558,9 +572,9 @@ void GeneratorCache::saveGeneratorCreature(Generator* gen)
+ 		ERROR("currID(%d) is broken !\n", mCurrentSaveCacheIdx);
+ 	}
+ 
+-	void* heap = (void*)(((u32)mCacheHeap + mUsedSize));
++	void* heap = (void*)(((uintptr_t)mCacheHeap + mUsedSize));
+ 	RamStream stream(heap, mFreeSize);
+-	PRINT("ramStream :%08x - %08x (%.2fK free)\n", (u32)heap, (u32)heap + mFreeSize, mFreeSize / 1024.0f);
++	PRINT("ramStream :%08x - %08x (%.2fK free)\n", PC_PTR_TO_U32(heap), PC_PTR_TO_U32(heap) + mFreeSize, mFreeSize / 1024.0f);
+ 	if (!gen->mLatestSpawnCreature) {
+ 		return;
+ 	}
+diff --git a/src/plugPikiKando/goalItem.cpp b/src/plugPikiKando/goalItem.cpp
+index b50f16d..b7bdc2a 100644
+--- a/src/plugPikiKando/goalItem.cpp
++++ b/src/plugPikiKando/goalItem.cpp
+@@ -160,6 +160,18 @@ void GoalItem::playEffect(int id)
+ 			if (gen) {
+ 				int legIDs[3] = { 2, 1, 0 };
+ 
++				// PC: UBSan's local-bounds reports "index 4 out of bounds for
++				// type 'RopeItem *[3]'" here, and it is CORRECT that it is out
++				// of bounds — but this is the documented leg overlay, not
++				// corruption. GoalItem.h:155 lays six consecutive pointer
++				// slots as interleaved (Fulcrum*, RopeItem*) pairs, so the
++				// `2 *` stride hops the fulcrums: 0 -> leg 0's rope (_448),
++				// 2 -> leg 1's (_450), 4 -> _458, which the header labels
++				// "leg 2 rope via overlay". Those fields were deliberately
++				// retyped from u32 to pointers so the overlay stays exact on
++				// LP64 (it was the onion-activation SIGSEGV before that).
++				// Indexing without the stride would read leg 1's FULCRUM as a
++				// rope. Audited 2026-07-27; do not "fix".
+ 				Vector3f test = -1.0f * mRope[2 * legIDs[randIdx]]->mRopeDirection;
+ 				gen->setEmitDir(test);
+ 			}
+diff --git a/src/plugPikiKando/itemMgr.cpp b/src/plugPikiKando/itemMgr.cpp
+index 5bc05b6..e0ba6d9 100644
+--- a/src/plugPikiKando/itemMgr.cpp
++++ b/src/plugPikiKando/itemMgr.cpp
+@@ -484,8 +484,14 @@ void ItemMgr::initialise()
+ 	registerClass(OBJTYPE_FallWater, new MizuItem(OBJTYPE_FallWater, mizuProp, mItemShapes[1], fwAI), sizeof(MizuItem));
+ 
+ 	// seems like these got initialised, but then their definitions got commented out? they're still used
+-	Shape* doorShape;
+-	Shape* keyShape;
++	// PC: on GC (WIN32 undefined) these really are read uninitialised and handed
++	// to KeyItem/DoorItem — retail's own UB. nullptr makes it deterministic:
++	// a key/door/gate that ever IS spawned faults at the shape instead of
++	// wandering off a stack-garbage pointer. Both object types are on the use
++	// list (itemMgr.cpp:397-399) and genItem can emit a Door, so this is a
++	// live-if-rare path, not dead code.
++	Shape* doorShape = nullptr;
++	Shape* keyShape  = nullptr;
+ #if defined(WIN32)
+ 	doorShape = gameflow.loadShape("objects/door.mod", true);
+ 	keyShape  = gameflow.loadShape("objects/key.mod", true);
+diff --git a/src/plugPikiKando/kio.cpp b/src/plugPikiKando/kio.cpp
+index 50047c5..20c37fb 100644
+--- a/src/plugPikiKando/kio.cpp
++++ b/src/plugPikiKando/kio.cpp
+@@ -194,7 +194,7 @@ void KIOContext::write()
+ 		HIOWriteMailbox(0x100000 | 0x4);
+ 
+ 		// Move the buffer pointer and decrease the buffer size
+-		mBufferStart = (void*)((u32)mBufferStart + writeSize);
++		mBufferStart = (void*)((uintptr_t)mBufferStart + writeSize);
+ 		mBufferSize -= writeSize;
+ 	}
+ }
+diff --git a/src/plugPikiKando/navi.cpp b/src/plugPikiKando/navi.cpp
+index 7025c9d..1943df4 100644
+--- a/src/plugPikiKando/navi.cpp
++++ b/src/plugPikiKando/navi.cpp
+@@ -1540,7 +1540,10 @@ void Navi::letPikiWork()
+ 				return;
+ 			}
+ 		}
+-		CollPart* part;
++		// PC: only the sluice branch assigns this, and the CollEvent below is
++		// built unconditionally. nullptr is what a "no specific part" collision
++		// event carries elsewhere in the codebase.
++		CollPart* part = nullptr;
+ 		if (mCollidedWorkObj->isSluice()) {
+ 			part = mCollidedWorkObj->mCollInfo->getSphere('gate');
+ 		}
+diff --git a/src/plugPikiKando/objectMgr.cpp b/src/plugPikiKando/objectMgr.cpp
+index bccc417..d0f66f3 100644
+--- a/src/plugPikiKando/objectMgr.cpp
++++ b/src/plugPikiKando/objectMgr.cpp
+@@ -749,7 +749,7 @@ int PolyObjectMgr::getTemplateIndex(int id)
+  */
+ Creature* PolyObjectMgr::get(int i)
+ {
+-	return (Creature*)((int)mObjectPool + mMaxSize * i);
++	return (Creature*)((uintptr_t)mObjectPool + mMaxSize * i);
+ }
+ 
+ /**
+diff --git a/src/plugPikiKando/pikiInf.cpp b/src/plugPikiKando/pikiInf.cpp
+index eaf1e4a..4bd1b36 100644
+--- a/src/plugPikiKando/pikiInf.cpp
++++ b/src/plugPikiKando/pikiInf.cpp
+@@ -251,8 +251,34 @@ void BPikiInf::doRestore(Creature* piki)
+ 	if (piki->mObjType != OBJTYPE_Pikihead) {
+ 		ERROR("mail to teppe2\n");
+ 	}
+-	static_cast<Piki*>(piki)->mPikiAnimMgr.mLowerAnimator.mStartKeyIndex = mPikiColour;
+-	static_cast<Piki*>(piki)->mPikiAnimMgr.mLowerAnimator.mEndKeyIndex   = mNextKeyIndex;
++	// PC: this used to cast to Piki* and write
++	// mPikiAnimMgr.mLowerAnimator.mStartKeyIndex / mEndKeyIndex. The object is a
++	// PikiHeadItem — the check right above asserts exactly that, and doStore
++	// casts to PikiHeadItem* — so the Piki* cast was always wrong. It WORKED on
++	// GameCube by coincidence of layout:
++	//
++	//     Piki::mPikiAnimMgr           _354
++	//       + PaniPikiAnimMgr::mLowerAnimator  _58
++	//       + PaniPikiAnimator::mStartKeyIndex _20   = 0x3CC
++	//                                mEndKeyIndex _24 = 0x3D0
++	//     PikiHeadItem::mSeedColor     _3CC
++	//     PikiHeadItem::mFlowerStage   _3D0
++	//
++	// i.e. it landed exactly on the two fields it meant to write. On LP64 the
++	// pointers ahead of _354 in Piki grow, the two layouts stop agreeing, and
++	// 0x3CC becomes ItemCreature::mItemShapeObject instead — so restoring a
++	// buried sprout wrote its COLOUR (2) over a shape pointer, and the next
++	// ItemCreature::init dereferenced it. Measured: SIGSEGV at 0xa (2 + the 8
++	// byte offset of mAnimMgr) on the first frame of any day that restores a
++	// buried Pikmin, i.e. day 3 of a normal playthrough. lldb confirmed
++	// &mItemShapeObject and &((Piki*)this)->...mStartKeyIndex are the same
++	// address on this target.
++	//
++	// Writing the intended fields directly is both correct and faithful: it
++	// reproduces what the GameCube layout accomplished, and it is the exact
++	// inverse of doStore above.
++	static_cast<PikiHeadItem*>(piki)->mSeedColor   = mPikiColour;
++	static_cast<PikiHeadItem*>(piki)->mFlowerStage = mNextKeyIndex;
+ }
+ 
+ /**
+diff --git a/src/plugPikiKando/resultFlag.cpp b/src/plugPikiKando/resultFlag.cpp
+index 33e0f90..39d02aa 100644
+--- a/src/plugPikiKando/resultFlag.cpp
++++ b/src/plugPikiKando/resultFlag.cpp
+@@ -376,8 +376,15 @@ void ResultFlags::dump()
+ #endif
+ 
+ 		// So as a result of all that, the final game version this PRINT contains brazen (but stripped) undefined behavior (`strs[3]`).
++		// PC: audited 2026-07-27 for the -O2 campaign and deliberately NOT
++		// changed — it is retail's own UB inside a PRINT that compiles to
++		// nothing. Suppressed locally so the always-on -Warray-bounds keeps
++		// meaning "something new", not "the four we already know about".
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Warray-bounds"
+ 		PRINT(" ENUM_RESULT_%s_G%02d_P00 = %s : %d pages\n", strs[3], p++, strs[getFlag(flagTable[i].mScreenId)],
+ 		      (flagTable[i + 1].mScreenId == -1) ? 1 : flagTable[i + 1].mScreenId - info.mScreenId);
++#pragma clang diagnostic pop
+ 	}
+ 	PRINT("*************************************************\n");
+ }
+diff --git a/src/plugPikiKando/routeMgr.cpp b/src/plugPikiKando/routeMgr.cpp
+index 2312964..e433a99 100644
+--- a/src/plugPikiKando/routeMgr.cpp
++++ b/src/plugPikiKando/routeMgr.cpp
+@@ -1136,7 +1136,7 @@ void RouteTracer::Context::setTarget(RouteTracer*)
+  */
+ int RouteTracer::Context::recognise(RouteTracer*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+@@ -1145,7 +1145,7 @@ int RouteTracer::Context::recognise(RouteTracer*)
+  */
+ bool RouteTracer::noLink()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -1172,7 +1172,7 @@ void RouteTracer::updateState()
+  */
+ Vector3f RouteTracer::getTarget()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(Vector3f());
+ }
+ 
+ /**
+diff --git a/src/plugPikiKando/workObject.cpp b/src/plugPikiKando/workObject.cpp
+index 053462f..d68c18b 100644
+--- a/src/plugPikiKando/workObject.cpp
++++ b/src/plugPikiKando/workObject.cpp
+@@ -1,4 +1,5 @@
+ #include "WorkObject.h"
++#include "pc_uninit.h"
+ #include "Age.h"
+ #include "DebugLog.h"
+ #include "DynColl.h"
+@@ -684,6 +685,20 @@ Vector3f HinderRock::getVertex(int vtx)
+ 		id = 'vtx3';
+ 		break;
+ 	}
++	// PC probe: `vtx` is a caller-supplied index. Out of range leaves `id` at
++	// the zero -ftrivial-auto-var-init gives it, so getSphere(0) looks up the
++	// empty fourcc and the ERROR below fires with a misleading index.
++	default:
++		PC_UNINIT_HIT("workObject.cpp:689 id", vtx);
++		// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++		// already zeroes this variable at its declaration and nothing assigns it on the
++		// path that reaches here, so this writes the value that is already there. It is
++		// present because adding a `default:` label PROMOTES the diagnostic from
++		// -Wconditional-uninitialized (not in the always-on set) to
++		// -Wsometimes-uninitialized (which is), and this branch must not spend the
++		// clean-build property to buy instrumentation.
++		id = 0;
++		break;
+ 	}
+ 
+ 	CollPart* part = mCollInfo->getSphere(id);
+diff --git a/src/plugPikiNakata/genteki.cpp b/src/plugPikiNakata/genteki.cpp
+index 5c62a8f..84a6ad2 100644
+--- a/src/plugPikiNakata/genteki.cpp
++++ b/src/plugPikiNakata/genteki.cpp
+@@ -1,4 +1,6 @@
+ #include "Age.h"
++#include "gameflow.h"
++#include <stdlib.h>
+ #include "DebugLog.h"
+ #include "Dolphin/os.h"
+ #include "Generator.h"
+@@ -100,6 +102,26 @@ Creature* GenObjectTeki::birth(BirthInfo& info)
+ 	if (!teki) {
+ 		return nullptr;
+ 	}
++#if defined(TARGET_PC)
++	// PC_TEKI_TRACE=1: every enemy actually created, with the generator that
++	// asked for it and where it landed. Chasing a boss that spawns on a map it
++	// does not belong to at all, twice, the second in the wrong place.
++	//
++	// This is the point of creation, unlike PC_GEN_TRACE which only sees the
++	// respawn-on-day-boundary path — measured to be 'piki' generators only, so
++	// the boss does not pass through it.
++	{
++		static int tt = -1;
++		if (tt < 0) {
++			tt = getenv("PC_TEKI_TRACE") ? 1 : 0;
++		}
++		if (tt) {
++			OSReport("[TEKI] type=%d day=%d pos=(%.0f,%.0f,%.0f) rebirth=%d gen=%p\n", (int)mTekiType,
++			         gameflow.mWorldClock.mCurrentDay, info.mPosition.x, info.mPosition.y, info.mPosition.z,
++			         info.mGenerator->getRebirthDay(), (void*)info.mGenerator);
++		}
++	}
++#endif
+ 
+ 	mPersonality->mPosition.set(info.mPosition);
+ 	mPersonality->mNestPosition.set(info.mScale);
+diff --git a/src/plugPikiNakata/nlibgeometry.cpp b/src/plugPikiNakata/nlibgeometry.cpp
+index 346cca5..b7da70b 100644
+--- a/src/plugPikiNakata/nlibgeometry.cpp
++++ b/src/plugPikiNakata/nlibgeometry.cpp
+@@ -1210,6 +1210,14 @@ NTransform3D::NTransform3D(immut NMatrix4f& mtx)
+  * @todo: Documentation
+  * @note UNUSED Size: 000020
+  */
++// PC: the two functions below call themselves unconditionally. Audited
++// 2026-07-27 for the -O2 campaign and left alone: both are UNUSED decomp
++// artifacts, and there is no evidence of what they were meant to forward to —
++// inventing a body would be worse than keeping the artifact visible.
++// Suppressed locally so the always-on -Winfinite-recursion keeps meaning
++// "something new".
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Winfinite-recursion"
+ void NTransform3D::construct(immut NMatrix4f& mtx)
+ {
+ 	construct(mtx);
+@@ -1236,6 +1244,7 @@ void NTransform3D::rotate(immut Vector3f& point)
+ 	outputRotation(rotation);
+ 	rotation.rotate(point);
+ }
++#pragma clang diagnostic pop
+ 
+ /**
+  * @todo: Documentation
+diff --git a/src/plugPikiNakata/nlibgeometry3d.cpp b/src/plugPikiNakata/nlibgeometry3d.cpp
+index 308b49a..e478539 100644
+--- a/src/plugPikiNakata/nlibgeometry3d.cpp
++++ b/src/plugPikiNakata/nlibgeometry3d.cpp
+@@ -281,7 +281,7 @@ void NPlane::construct(NPlane&)
+  */
+ bool NPlane::intersects(NLine&, f32*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -290,7 +290,7 @@ bool NPlane::intersects(NLine&, f32*)
+  */
+ bool NPlane::outputIntersection(NLine&, NVector3f&)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -299,7 +299,7 @@ bool NPlane::outputIntersection(NLine&, NVector3f&)
+  */
+ bool NPlane::intersectsRay(NLine&, f32*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -308,7 +308,7 @@ bool NPlane::intersectsRay(NLine&, f32*)
+  */
+ bool NPlane::outputRayIntersection(NLine&, NVector3f&)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -317,7 +317,7 @@ bool NPlane::outputRayIntersection(NLine&, NVector3f&)
+  */
+ bool NPlane::intersectsSegment(NSegment&, f32*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -326,7 +326,7 @@ bool NPlane::intersectsSegment(NSegment&, f32*)
+  */
+ bool NPlane::outputSegmentIntersection(NSegment&, NVector3f&)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -364,7 +364,7 @@ void NPlane::negate()
+  */
+ bool NPlane::adjustTo(NVector3f&, f32)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -373,7 +373,7 @@ bool NPlane::adjustTo(NVector3f&, f32)
+  */
+ bool NPlane::adjust(NVector3f&)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -382,7 +382,7 @@ bool NPlane::adjust(NVector3f&)
+  */
+ bool NPlane::outputIntersectionLineY(NPlane&, NLine&)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -391,7 +391,7 @@ bool NPlane::outputIntersectionLineY(NPlane&, NLine&)
+  */
+ f32 NPlane::calcAngle(NPlane&)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0.0f);
+ }
+ 
+ /**
+@@ -400,7 +400,7 @@ f32 NPlane::calcAngle(NPlane&)
+  */
+ f32 NPlane::calcY(f32, f32)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0.0f);
+ }
+ 
+ /**
+@@ -476,7 +476,7 @@ void NSegment::construct(NSegment&)
+  */
+ f32 NSegment::calcDistanceAsSegment(NVector3f&, f32*, f32*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0.0f);
+ }
+ 
+ /**
+@@ -485,7 +485,7 @@ f32 NSegment::calcDistanceAsSegment(NVector3f&, f32*, f32*)
+  */
+ f32 NSegment::calcDistanceAsSegment(NLine&, f32*, f32*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0.0f);
+ }
+ 
+ /**
+@@ -494,7 +494,7 @@ f32 NSegment::calcDistanceAsSegment(NLine&, f32*, f32*)
+  */
+ f32 NSegment::calcSegmentDistanceAsSegment(NSegment&, f32*, f32*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0.0f);
+ }
+ 
+ /**
+diff --git a/src/plugPikiNakata/nlibspline.cpp b/src/plugPikiNakata/nlibspline.cpp
+index 526b044..ddc2a26 100644
+--- a/src/plugPikiNakata/nlibspline.cpp
++++ b/src/plugPikiNakata/nlibspline.cpp
+@@ -355,7 +355,7 @@ SplineSegment::SplineSegment()
+  */
+ f32 SplineSegment::calcDistance(NVector3f&, f32*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0.0f);
+ }
+ 
+ /**
+@@ -392,7 +392,7 @@ void SplineCurve::makeFunctions(int, f32*, f32*, NPolynomialFunction**)
+ template <>
+ int NArray<SplineKeyFrame>::indexOf(SplineKeyFrame*, int)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(-1);
+ }
+ 
+ /**
+@@ -432,7 +432,7 @@ void NArray<SplineKeyFrame>::insert(int, SplineKeyFrame*)
+ template <>
+ SplineKeyFrame* NArray<SplineKeyFrame>::firstElement()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(nullptr);
+ }
+ 
+ /**
+@@ -442,7 +442,7 @@ SplineKeyFrame* NArray<SplineKeyFrame>::firstElement()
+ template <>
+ SplineKeyFrame* NArray<SplineKeyFrame>::lastElement()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(nullptr);
+ }
+ 
+ /**
+@@ -452,7 +452,7 @@ SplineKeyFrame* NArray<SplineKeyFrame>::lastElement()
+ template <>
+ int NArray<SplineSegment>::indexOf(SplineSegment*, int)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(-1);
+ }
+ 
+ /**
+@@ -492,7 +492,7 @@ void NArray<SplineSegment>::insert(int, SplineSegment*)
+ template <>
+ SplineSegment* NArray<SplineSegment>::firstElement()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(nullptr);
+ }
+ 
+ /**
+@@ -502,7 +502,7 @@ SplineSegment* NArray<SplineSegment>::firstElement()
+ template <>
+ SplineSegment* NArray<SplineSegment>::lastElement()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(nullptr);
+ }
+ 
+ /**
+@@ -532,7 +532,7 @@ void NArray<SplineSegment>::add(int, SplineSegment*)
+ template <>
+ int NArray<SplineSegment>::indexOf(SplineSegment*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(-1);
+ }
+ 
+ /**
+@@ -542,7 +542,7 @@ int NArray<SplineSegment>::indexOf(SplineSegment*)
+ template <>
+ bool NArray<SplineSegment>::contains(SplineSegment*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -572,7 +572,7 @@ void NArray<SplineKeyFrame>::add(int, SplineKeyFrame*)
+ template <>
+ int NArray<SplineKeyFrame>::indexOf(SplineKeyFrame*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(-1);
+ }
+ 
+ /**
+@@ -582,5 +582,5 @@ int NArray<SplineKeyFrame>::indexOf(SplineKeyFrame*)
+ template <>
+ bool NArray<SplineKeyFrame>::contains(SplineKeyFrame*)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+diff --git a/src/plugPikiNakata/taiattackactions.cpp b/src/plugPikiNakata/taiattackactions.cpp
+index 626cd68..37dfa7f 100644
+--- a/src/plugPikiNakata/taiattackactions.cpp
++++ b/src/plugPikiNakata/taiattackactions.cpp
+@@ -94,10 +94,21 @@ bool TaiAnimationSwallowingAction::act(Teki& teki)
+ 		Vector3f center;
+ 		teki.outputHitCenter(center);
+ 
+-		TekiAndCondition andCond1(stack_new(TekiRecognitionCondition)(&teki),
+-		                          stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(&teki)));
+-		TekiAndCondition andCond2(&andCond1, stack_new(TekiNotCondition)(stack_new(TekiPikiStateCondition)(PIKISTATE_Flick)));
+-		TekiAndCondition andCond3(&andCond2, stack_new(TekiPositionSphereDistanceCondition)(center, teki.getAttackHitRange()));
++		// PC: these were stack_new() temporaries. As an immediate call argument that
++		// is fine — the temporary lives to the end of the full expression — but here
++		// the pointers are STORED in a named local that outlives the statement, so
++		// under C++ rules they dangle from the next statement on. MWCC gave them the
++		// enclosing frame's lifetime, which is what the code assumes. Naming them
++		// restores exactly that and nothing else. See docs/ARCHITECTURE.md work list E.
++		TekiRecognitionCondition recogCond(&teki);
++		TekiStickerCondition stickerCond(&teki);
++		TekiNotCondition notStickerCond(&stickerCond);
++		TekiPikiStateCondition flickStateCond(PIKISTATE_Flick);
++		TekiNotCondition notFlickCond(&flickStateCond);
++		TekiPositionSphereDistanceCondition hitRangeCond(center, teki.getAttackHitRange());
++		TekiAndCondition andCond1(&recogCond, &notStickerCond);
++		TekiAndCondition andCond2(&andCond1, &notFlickCond);
++		TekiAndCondition andCond3(&andCond2, &hitRangeCond);
+ 
+ 		int swallowPikiNum = 0;
+ 		int numSlots       = 0;
+diff --git a/src/plugPikiNakata/taichappy.cpp b/src/plugPikiNakata/taichappy.cpp
+index d14a7e6..fca7675 100644
+--- a/src/plugPikiNakata/taichappy.cpp
++++ b/src/plugPikiNakata/taichappy.cpp
+@@ -569,10 +569,18 @@ TaiChappyStrategy::TaiChappyStrategy(TekiParameters* params)
+  */
+ bool TaiChappyCryAction::act(Teki& teki)
+ {
+-	TekiAndCondition NRef cond = TekiAndCondition(
+-	    stack_new(TekiTypeCondition)(TEKI_Swallow),
+-	    stack_new(TekiAndCondition)(stack_new(TekiOrCondition)(stack_new(TekiStateCondition)(15), stack_new(TekiStateCondition)(1)),
+-	                                stack_new(TekiDistanceCondition)(&teki, teki.getParameterF(TPF_MessageRange))));
++	// PC: named locals, not stack_new() temporaries — the pointers are stored in
++	// `cond`, which outlives the statement, so under C++ rules they dangle from
++	// the next statement on. Second pass: the first &temporary audit classified
++	// sites by the line the warning landed on, and a multi-line declaration puts
++	// that on a CONTINUATION line, so these were missed. docs/ARCHITECTURE.md list E.
++	TekiTypeCondition swallowTypeCond(TEKI_Swallow);
++	TekiStateCondition state15Cond(15);
++	TekiStateCondition state1Cond(1);
++	TekiOrCondition eitherStateCond(&state15Cond, &state1Cond);
++	TekiDistanceCondition inMessageRangeCond(&teki, teki.getParameterF(TPF_MessageRange));
++	TekiAndCondition stateAndRangeCond(&eitherStateCond, &inMessageRangeCond);
++	TekiAndCondition NRef cond = TekiAndCondition(&swallowTypeCond, &stateAndRangeCond);
+ 	Creature* bulborb = tekiMgr->findClosest(teki.getPosition(), &cond);
+ 	if (!bulborb) {
+ 		return false;
+diff --git a/src/plugPikiNakata/taicollec.cpp b/src/plugPikiNakata/taicollec.cpp
+index 626d588..1ac9870 100644
+--- a/src/plugPikiNakata/taicollec.cpp
++++ b/src/plugPikiNakata/taicollec.cpp
+@@ -1042,8 +1042,14 @@ bool TaiCollecPelletLostAction::act(Teki& teki)
+ 		return true;
+ 	}
+ 
+-	TekiAndCondition NRef cond = TekiAndCondition(
+-	    stack_new(TekiVisibleCondition)(&teki), stack_new(TekiCollecTargetPelletCondition)(&teki, teki.getParameterI(COLLECPI_CarryPower)));
++	// PC: named locals, not stack_new() temporaries — the pointers are stored in
++	// `cond`, which outlives the statement, so under C++ rules they dangle from
++	// the next statement on. Second pass: the first &temporary audit classified
++	// sites by the line the warning landed on, and a multi-line declaration puts
++	// that on a CONTINUATION line, so these were missed. docs/ARCHITECTURE.md list E.
++	TekiVisibleCondition visibleCond(&teki);
++	TekiCollecTargetPelletCondition targetPelletCond(&teki, teki.getParameterI(COLLECPI_CarryPower));
++	TekiAndCondition NRef cond = TekiAndCondition(&visibleCond, &targetPelletCond);
+ 	if (!cond.satisfy(target)) {
+ 		teki.clearCreaturePointer(0);
+ 		return true;
+diff --git a/src/plugPikiNakata/taikinoko.cpp b/src/plugPikiNakata/taikinoko.cpp
+index f57f78f..8e2517c 100644
+--- a/src/plugPikiNakata/taikinoko.cpp
++++ b/src/plugPikiNakata/taikinoko.cpp
+@@ -533,8 +533,15 @@ bool TaiKinokoDischargingSporesAction::act(Teki& teki)
+ 		} else if (teki.getAnimationKeyOption(BTeki::ANIMATION_KEY_OPTION_ACTION_2)) {
+ 			PRINT_NAKATA("TaiKinokoDischargingSporesAction:act:%08x:ACTION_2:\n", &teki);
+ 			InteractSpore NRef spore = InteractSpore(&teki);
+-			TekiAndCondition andCond(stack_new(TekiRecognitionCondition)(&teki),
+-			                         stack_new(TekiDistanceCondition)(&teki, teki.getAttackRange()));
++			// PC: these were stack_new() temporaries. As an immediate call argument that
++			// is fine — the temporary lives to the end of the full expression — but here
++			// the pointers are STORED in a named local that outlives the statement, so
++			// under C++ rules they dangle from the next statement on. MWCC gave them the
++			// enclosing frame's lifetime, which is what the code assumes. Naming them
++			// restores exactly that and nothing else. See docs/ARCHITECTURE.md work list E.
++			TekiRecognitionCondition recogCond(&teki);
++			TekiDistanceCondition distCond(&teki, teki.getAttackRange());
++			TekiAndCondition andCond(&recogCond, &distCond);
+ 			teki.interactNaviPiki(spore, andCond);
+ 			rumbleMgr->start(RUMBLE_Unk6, 0, teki.getPosition());
+ 		}
+diff --git a/src/plugPikiNakata/tainapkid.cpp b/src/plugPikiNakata/tainapkid.cpp
+index bad32b2..0deeed9 100644
+--- a/src/plugPikiNakata/tainapkid.cpp
++++ b/src/plugPikiNakata/tainapkid.cpp
+@@ -1313,10 +1313,18 @@ bool TaiNapkidCatchingAction::act(Teki& teki)
+ 	NVector3f offset;
+ 	offset.add2(teki.getPosition(), direction);
+ 
+-	TekiAndCondition notStickerAndIsRecognizedCond(stack_new(TekiRecognitionCondition)(&teki),
+-	                                               stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(&teki)));
+-	TekiAndCondition posSphereDistAndOtherConds(
+-	    &notStickerAndIsRecognizedCond, stack_new(TekiPositionSphereDistanceCondition)(offset, teki.getParameterF(TPF_AttackHitRange)));
++	// PC: these were stack_new() temporaries. As an immediate call argument that
++	// is fine — the temporary lives to the end of the full expression — but here
++	// the pointers are STORED in a named local that outlives the statement, so
++	// under C++ rules they dangle from the next statement on. MWCC gave them the
++	// enclosing frame's lifetime, which is what the code assumes. Naming them
++	// restores exactly that and nothing else. See docs/ARCHITECTURE.md work list E.
++	TekiRecognitionCondition recogCond(&teki);
++	TekiStickerCondition stickerCond(&teki);
++	TekiNotCondition notStickerCond(&stickerCond);
++	TekiPositionSphereDistanceCondition hitRangeCond(offset, teki.getParameterF(TPF_AttackHitRange));
++	TekiAndCondition notStickerAndIsRecognizedCond(&recogCond, &notStickerCond);
++	TekiAndCondition posSphereDistAndOtherConds(&notStickerAndIsRecognizedCond, &hitRangeCond);
+ 
+ 	Iterator iter(pikiMgr);
+ 	CI_LOOP(iter)
+diff --git a/src/plugPikiNakata/taiotimoti.cpp b/src/plugPikiNakata/taiotimoti.cpp
+index 7f36edd..eefb2a0 100644
+--- a/src/plugPikiNakata/taiotimoti.cpp
++++ b/src/plugPikiNakata/taiotimoti.cpp
+@@ -964,10 +964,18 @@ bool TaiOtimotiPressingAction::actByEvent(immut TekiEvent& event)
+ 		Teki* teki = event.mTeki;
+ 
+ 		InteractPress NRef press = InteractPress(teki, teki->getParameterF(TPF_AttackPower));
+-		TekiAndCondition NRef cond
+-		    = TekiAndCondition(stack_new(TekiRecognitionCondition)(teki),
+-		                       stack_new(TekiAndCondition)(stack_new(TekiDistanceCondition)(teki, teki->getAttackRange()),
+-		                                                   stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(teki))));
++		// PC: named locals, not stack_new() temporaries — `cond` stores the
++		// pointers and is used on the next statement, so under C++ rules they
++		// dangle. Third pass: this one has the `=` on a continuation line, so
++		// even the statement-based classifier of round 2 did not match it; it
++		// came out of reading all 39 remaining enclosing statements by hand.
++		// docs/ARCHITECTURE.md work list E.
++		TekiRecognitionCondition recogCond(teki);
++		TekiDistanceCondition inAttackRangeCond(teki, teki->getAttackRange());
++		TekiStickerCondition stickerCond(teki);
++		TekiNotCondition notStickerCond(&stickerCond);
++		TekiAndCondition rangeAndNotSticker(&inAttackRangeCond, &notStickerCond);
++		TekiAndCondition NRef cond = TekiAndCondition(&recogCond, &rangeAndNotSticker);
+ 		teki->interactNaviPiki(press, cond);
+ 		teki->flickUpper();
+ 		teki->mDamageCount = 0.0f;
+diff --git a/src/plugPikiNakata/taipalm.cpp b/src/plugPikiNakata/taipalm.cpp
+index 57d464e..ec31357 100644
+--- a/src/plugPikiNakata/taipalm.cpp
++++ b/src/plugPikiNakata/taipalm.cpp
+@@ -305,9 +305,20 @@ void TaiPalmStrategy::start(Teki& teki)
+ 
+ 	f32 rad = 2.0f * teki.getParameterF(TPF_CollisionRadius);
+ 
+-	TekiAndCondition NRef cond = TekiAndCondition(
+-	    stack_new(TekiNotCondition)(stack_new(TekiCreaturePointerCondition)(&teki)),
+-	    stack_new(TekiAndCondition)(stack_new(TekiTypeCondition)(teki.mTekiType), stack_new(TekiDistanceCondition)(&teki, rad)));
++	// PC: named locals, not stack_new() temporaries — the pointers are stored in
++	// `cond`, which outlives the statement, so under C++ rules they dangle from
++	// the next statement on. Second pass: the first &temporary audit classified
++	// sites by the line the warning landed on, and a multi-line declaration puts
++	// that on a CONTINUATION line, so these were missed. docs/ARCHITECTURE.md list E.
++	// This one is not theoretical: at -O2 it faulted in TekiAndCondition::satisfy
++	// jumping through a dangling mConditionA into the middle of Teki's vtable,
++	// on the very first generator birth of day 1.
++	TekiCreaturePointerCondition selfPtrCond(&teki);
++	TekiNotCondition notSelfCond(&selfPtrCond);
++	TekiTypeCondition sameTypeCond(teki.mTekiType);
++	TekiDistanceCondition withinRadCond(&teki, rad);
++	TekiAndCondition sameTypeNearCond(&sameTypeCond, &withinRadCond);
++	TekiAndCondition NRef cond = TekiAndCondition(&notSelfCond, &sameTypeNearCond);
+ 	Creature* neighbor = tekiMgr->findClosest(teki.getPosition(), &cond);
+ 	PRINT_NAKATA("TaiPalmStrategy::start:%08x:neighbor:%08x\n", &teki, neighbor);
+ 
+diff --git a/src/plugPikiNakata/taireactionactions.cpp b/src/plugPikiNakata/taireactionactions.cpp
+index 3c83dff..48c5acc 100644
+--- a/src/plugPikiNakata/taireactionactions.cpp
++++ b/src/plugPikiNakata/taireactionactions.cpp
+@@ -216,7 +216,15 @@ bool TaiTargetNearestCollisionAction::actByEvent(immut TekiEvent& event)
+ 		return false;
+ 	}
+ 	Creature* target = event.mOther;
+-	TekiAndCondition cond(stack_new(TekiRecognitionCondition)(event.mTeki), stack_new(TekiNaviPikiCondition)());
++	// PC: these were stack_new() temporaries. As an immediate call argument that
++	// is fine — the temporary lives to the end of the full expression — but here
++	// the pointers are STORED in a named local that outlives the statement, so
++	// under C++ rules they dangle from the next statement on. MWCC gave them the
++	// enclosing frame's lifetime, which is what the code assumes. Naming them
++	// restores exactly that and nothing else. See docs/ARCHITECTURE.md work list E.
++	TekiRecognitionCondition recogCond(event.mTeki);
++	TekiNaviPikiCondition naviPikiCond;
++	TekiAndCondition cond(&recogCond, &naviPikiCond);
+ 	if (!cond.satisfy(target)) {
+ 		return false;
+ 	}
+diff --git a/src/plugPikiNakata/taishell.cpp b/src/plugPikiNakata/taishell.cpp
+index dc24090..3cc326e 100644
+--- a/src/plugPikiNakata/taishell.cpp
++++ b/src/plugPikiNakata/taishell.cpp
+@@ -369,12 +369,21 @@ bool TaiShellNaviPikiInsideAction::act(Teki& teki)
+  */
+ bool TaiShellEatAction::act(Teki& teki)
+ {
+-	TekiAndCondition andCond(stack_new(TekiRecognitionCondition)(&teki),
+-	                         stack_new(TekiNotCondition)(stack_new(TekiStickerCondition)(&teki)));
++	// PC: these were stack_new() temporaries. As an immediate call argument that
++	// is fine — the temporary lives to the end of the full expression — but here
++	// the pointers are STORED in a named local that outlives the statement, so
++	// under C++ rules they dangle from the next statement on. MWCC gave them the
++	// enclosing frame's lifetime, which is what the code assumes. Naming them
++	// restores exactly that and nothing else. See docs/ARCHITECTURE.md work list E.
++	TekiRecognitionCondition recogCond(&teki);
++	TekiStickerCondition stickerCond(&teki);
++	TekiNotCondition notStickerCond(&stickerCond);
++	TekiAndCondition andCond(&recogCond, &notStickerCond);
+ 
+ 	NVector3f spawnPos;
+ 	teki.outputSpawnPosition(spawnPos);
+-	TekiAndCondition posDistAndAnd(&andCond, stack_new(TekiPositionDistanceCondition)(spawnPos, teki.getAttackableRange()));
++	TekiPositionDistanceCondition attackRangeCond(spawnPos, teki.getAttackableRange());
++	TekiAndCondition posDistAndAnd(&andCond, &attackRangeCond);
+ 	return teki.interactNaviPiki(InteractSwallow(&teki, nullptr, 0), posDistAndAnd);
+ 
+ 	// i am not proud of what this project has required of me spiritually
+diff --git a/src/plugPikiNakata/taiswallow.cpp b/src/plugPikiNakata/taiswallow.cpp
+index a0c3de0..3363be3 100644
+--- a/src/plugPikiNakata/taiswallow.cpp
++++ b/src/plugPikiNakata/taiswallow.cpp
+@@ -720,7 +720,15 @@ bool TaiSwallowTurningAction::act(Teki& teki)
+ 		return true;
+ 	}
+ 
+-	TekiAndCondition NRef cond = TekiAndCondition(stack_new(TekiRecognitionCondition)(&teki), stack_new(TekiLowerCondition)(&teki));
++	// PC: these were stack_new() temporaries. As an immediate call argument that
++	// is fine — the temporary lives to the end of the full expression — but here
++	// the pointers are STORED in a named local that outlives the statement, so
++	// under C++ rules they dangle from the next statement on. MWCC gave them the
++	// enclosing frame's lifetime, which is what the code assumes. Naming them
++	// restores exactly that and nothing else. See docs/ARCHITECTURE.md work list E.
++	TekiRecognitionCondition condRecog(&teki);
++	TekiLowerCondition condLower(&teki);
++	TekiAndCondition NRef cond = TekiAndCondition(&condRecog, &condLower);
+ 	int pikiCount              = teki.countPikis(cond);
+ 	f32 linFuncValues[2];
+ 	NClampLinearFunction linFunc(linFuncValues);
+@@ -779,11 +787,19 @@ void TaiSwallowFlickingAction::flick(Teki& teki)
+ 	teki.flickUpper();
+ 	InteractFlick NRef flick
+ 	    = InteractFlick(&teki, teki.getParameterF(TPF_LowerFlickPower), teki.getParameterF(TPF_LowerAttackPower), FLICK_BACKWARDS_ANGLE);
+-	TekiAndCondition NRef cond = TekiAndCondition(
+-	    stack_new(TekiAndCondition)(stack_new(TekiRecognitionCondition)(&teki),
+-	                                stack_new(TekiNotCondition)(stack_new(TekiStickingCondition)())),
+-	    stack_new(TekiAndCondition)(stack_new(TekiDistanceCondition)(&teki, teki.getLowerRange()),
+-	                                stack_new(TekiAngleCondition)(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle))));
++	// PC: named locals, not stack_new() temporaries — the pointers are stored in
++	// `cond`, which outlives the statement, so under C++ rules they dangle from
++	// the next statement on. Second pass: the first &temporary audit classified
++	// sites by the line the warning landed on, and a multi-line declaration puts
++	// that on a CONTINUATION line, so these were missed. docs/ARCHITECTURE.md list E.
++	TekiRecognitionCondition recogCond(&teki);
++	TekiStickingCondition stickingCond;
++	TekiNotCondition notStickingCond(&stickingCond);
++	TekiAndCondition recogAndNotSticking(&recogCond, &notStickingCond);
++	TekiDistanceCondition inLowerRangeCond(&teki, teki.getLowerRange());
++	TekiAngleCondition inFlickAngleCond(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle));
++	TekiAndCondition rangeAndAngleCond(&inLowerRangeCond, &inFlickAngleCond);
++	TekiAndCondition NRef cond = TekiAndCondition(&recogAndNotSticking, &rangeAndAngleCond);
+ 	teki.interactNaviPiki(flick, cond);
+ 
+ 	TekiAndCondition(nullptr, nullptr);
+@@ -799,11 +815,19 @@ bool TaiSwallowSwallowingFlickAction::act(Teki& teki)
+ 	if (teki.getAnimationKeyOption(BTeki::ANIMATION_KEY_OPTION_ACTION_0)) {
+ 		InteractFlick NRef flick   = InteractFlick(&teki, teki.getParameterF(TPF_LowerFlickPower), teki.getParameterF(TPF_LowerAttackPower),
+ 		                                           teki.getDirection() + NMathF::pi);
+-		TekiAndCondition NRef cond = TekiAndCondition(
+-		    stack_new(TekiAndCondition)(stack_new(TekiRecognitionCondition)(&teki),
+-		                                stack_new(TekiNotCondition)(stack_new(TekiStickingCondition)())),
+-		    stack_new(TekiAndCondition)(stack_new(TekiDistanceCondition)(&teki, teki.getLowerRange()),
+-		                                stack_new(TekiAngleCondition)(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle))));
++		// PC: named locals, not stack_new() temporaries — the pointers are stored in
++		// `cond`, which outlives the statement, so under C++ rules they dangle from
++		// the next statement on. Second pass: the first &temporary audit classified
++		// sites by the line the warning landed on, and a multi-line declaration puts
++		// that on a CONTINUATION line, so these were missed. docs/ARCHITECTURE.md list E.
++		TekiRecognitionCondition recogCond(&teki);
++		TekiStickingCondition stickingCond;
++		TekiNotCondition notStickingCond(&stickingCond);
++		TekiAndCondition recogAndNotSticking(&recogCond, &notStickingCond);
++		TekiDistanceCondition inLowerRangeCond(&teki, teki.getLowerRange());
++		TekiAngleCondition inFlickAngleCond(&teki, teki.getParameterF(SWALLOWPF_FlickLowerAngle));
++		TekiAndCondition rangeAndAngleCond(&inLowerRangeCond, &inFlickAngleCond);
++		TekiAndCondition NRef cond = TekiAndCondition(&recogAndNotSticking, &rangeAndAngleCond);
+ 		teki.interactNaviPiki(flick, cond);
+ 	}
+ 	return false;
+diff --git a/src/plugPikiNakata/tekibteki.cpp b/src/plugPikiNakata/tekibteki.cpp
+index 423ee84..6297bd2 100644
+--- a/src/plugPikiNakata/tekibteki.cpp
++++ b/src/plugPikiNakata/tekibteki.cpp
+@@ -1426,7 +1426,10 @@ bool BTeki::attackRangeNaviPiki(immut Interaction& interaction, immut Condition&
+ 	outputHitCenter(hitCenter);
+ 
+ 	// Fun Fact: Decompiling this unused function fixed a fakematch related to `TekiAndCondition` in this file.
+-	TekiAndCondition andCond(&condition, stack_new(TekiPositionSphereDistanceCondition)(hitCenter, getAttackHitRange()));
++	// PC: stack_new temporary stored in `andCond` — named so its lifetime
++	// matches. docs/ARCHITECTURE.md work list E.
++	TekiPositionSphereDistanceCondition hitRangeCond(hitCenter, getAttackHitRange());
++	TekiAndCondition andCond(&condition, &hitRangeCond);
+ 	return interactNaviPiki(interaction, andCond);
+ }
+ 
+@@ -1566,9 +1569,18 @@ void BTeki::flickLower()
+  */
+ void BTeki::flickLower(InteractFlick& flick)
+ {
+-	TekiAndCondition andCond(stack_new(TekiAndCondition)(stack_new(TekiRecognitionCondition)(static_cast<Teki*>(this)),
+-	                                                     stack_new(TekiNotCondition)(stack_new(TekiStickingCondition)())),
+-	                         stack_new(TekiDistanceCondition)(static_cast<Teki*>(this), getLowerRange()));
++	// PC: these were stack_new() temporaries. As an immediate call argument that
++	// is fine — the temporary lives to the end of the full expression — but here
++	// the pointers are STORED in a named local that outlives the statement, so
++	// under C++ rules they dangle from the next statement on. MWCC gave them the
++	// enclosing frame's lifetime, which is what the code assumes. Naming them
++	// restores exactly that and nothing else. See docs/ARCHITECTURE.md work list E.
++	TekiRecognitionCondition recogCond(static_cast<Teki*>(this));
++	TekiStickingCondition stickingCond;
++	TekiNotCondition notStickingCond(&stickingCond);
++	TekiAndCondition recogAndNotSticking(&recogCond, &notStickingCond);
++	TekiDistanceCondition lowerRangeCond(static_cast<Teki*>(this), getLowerRange());
++	TekiAndCondition andCond(&recogAndNotSticking, &lowerRangeCond);
+ 	interactNavi(flick, andCond);
+ 	flick.mDamage = 0.0f;
+ 
+diff --git a/src/plugPikiNishimura/BossMgr.cpp b/src/plugPikiNishimura/BossMgr.cpp
+index e44b363..7207752 100644
+--- a/src/plugPikiNishimura/BossMgr.cpp
++++ b/src/plugPikiNishimura/BossMgr.cpp
+@@ -1,4 +1,5 @@
+ #include "Boss.h"
++#include <stdlib.h>
+ #include "CoreNucleus.h"
+ #include "DebugLog.h"
+ #include "Generator.h"
+@@ -616,6 +617,25 @@ void BossMgr::init(int bossID, int count)
+ Creature* BossMgr::create(int genBossID, BirthInfo& birthInfo, GenObjectBoss* genBoss)
+ {
+ 	Boss* boss = nullptr;
++#if defined(TARGET_PC)
++	// PC_BOSS_TRACE=1: every boss creation, with the GenBossID that asked for it.
++	// Bosses do NOT go through GenObjectTeki, so PC_TEKI_TRACE cannot see them.
++	//
++	// Chasing a Beady Long Legs on a map it does not belong to. Note
++	// GENBOSS_Spider is 0, so a genBossID field that failed to load reads as
++	// exactly this boss — which makes "is it really 0?" the question.
++	{
++		static int bt = -1;
++		if (bt < 0) {
++			bt = getenv("PC_BOSS_TRACE") ? 1 : 0;
++		}
++		if (bt) {
++			OSReport("[BOSS] genBossID=%d day=%d pos=(%.0f,%.0f,%.0f) genBoss=%p\n", genBossID,
++			         gameflow.mWorldClock.mCurrentDay, birthInfo.mPosition.x, birthInfo.mPosition.y, birthInfo.mPosition.z,
++			         (void*)genBoss);
++		}
++	}
++#endif
+ 	switch (genBossID) {
+ 	case GENBOSS_Spider:
+ 	{
+diff --git a/src/plugPikiNishimura/HmRumbleMgr.cpp b/src/plugPikiNishimura/HmRumbleMgr.cpp
+index 17d95bf..75e3180 100644
+--- a/src/plugPikiNishimura/HmRumbleMgr.cpp
++++ b/src/plugPikiNishimura/HmRumbleMgr.cpp
+@@ -89,6 +89,22 @@ void ChannelMgr::reset()
+ void ChannelMgr::start(int idx, f32* valuePtr)
+ {
+ 	mRumbleTimer = 0.0f;
++	// PC: mDataMgr IS null here, and UBSan says so on every run
++	// ("member call on null pointer of type 'ChannelDataMgr'"). Audited
++	// 2026-07-27 and deliberately left alone — it is not a port bug:
++	//
++	//   - RumbleMgr::init() is never called. gameflow.cpp:626 constructs the
++	//     manager and nothing else, so ControlerMgr::init() — which is what
++	//     would assign mDataMgr — never runs.
++	//   - ControlerMgr::init() is annotated "@note UNUSED", meaning it was
++	//     dead-stripped from retail. GameCube had a null here too.
++	//   - It is harmless in both because getChannelDataTbl() returns
++	//     &channelDataTbl[row] from a file-scope table and never touches
++	//     `this`, so the call needs no object.
++	//
++	// The report is real UB and worth keeping visible, but the fragility is
++	// future-tense: it only becomes a fault if getChannelDataTbl ever starts
++	// using its mDataTbl member (which ChannelDataMgr::init would have set).
+ 	mData        = mDataMgr->getChannelDataTbl(idx);
+ 	mActiveType  = idx;
+ 	if (valuePtr) {
+diff --git a/src/plugPikiNishimura/KingAi.cpp b/src/plugPikiNishimura/KingAi.cpp
+index 2e59c30..5faac86 100644
+--- a/src/plugPikiNishimura/KingAi.cpp
++++ b/src/plugPikiNishimura/KingAi.cpp
+@@ -1,4 +1,5 @@
+ #include "Collision.h"
++#include "pc_uninit.h"
+ #include "DebugLog.h"
+ #include "GameStat.h"
+ #include "Interactions.h"
+@@ -885,6 +886,16 @@ bool KingAi::chaseNaviTransit()
+ 		if (navi->isAlive() && navi->isVisible() && !navi->isBuried()) {
+ 
+ 			f32 qdist = qdist2(mKing->mSRT.t.x, mKing->mSRT.t.z, navi->mSRT.t.x, navi->mSRT.t.z);
++			// PC probe: census -Wconditional-uninitialized (`dist`). The typo
++			// noted below means `dist` is READ before its first assignment on
++			// every first iteration, and thereafter carries the previous
++			// iteration's value. Unlike the switch sites there is no "did it
++			// happen" test to make, so this counts EVERY evaluation and records
++			// the value: a `lo` of 0 in the report is the uninitialized read
++			// showing up, because -ftrivial-auto-var-init zeroes it and 0 is
++			// always < minDist — the typo'd condition becomes a no-op on PC,
++			// where on GameCube stack residue could suppress the whole check.
++			PC_UNINIT_HIT("KingAi.cpp:890 dist (read-count)", dist);
+ 			if (qdist < C_BOSS_PROP(mKing).mSearchRadius() &&
+ 			    // typo?? this should be qdist, not dist.
+ 			    dist < minDist && mKing->inSearchAngle(navi)) {
+diff --git a/src/plugPikiNishimura/KoganeAi.cpp b/src/plugPikiNishimura/KoganeAi.cpp
+index f3ff620..7834fd2 100644
+--- a/src/plugPikiNishimura/KoganeAi.cpp
++++ b/src/plugPikiNishimura/KoganeAi.cpp
+@@ -414,6 +414,10 @@ void KoganeAi::birthItemWater(int numDrops, f32 p2)
+ 		angleOffset = PI * p2 / (numDrops - 1);
+ 	}
+ 
++	// Census -Wconditional-uninitialized (`initAngle`, `angleOffset` — 2 of the
++	// 40): AUDITED NON-BUG. They are assigned under `numDrops == 1` and
++	// `numDrops > 1`, and read under `numDrops > 0`. For an int, `> 0` implies
++	// `== 1 || > 1`, so the guard is covered by the union of the two arms.
+ 	if (numDrops > 0) {
+ 		for (int i = 0; i < numDrops; i++) {
+ 			f32 angle         = i * angleOffset + initAngle;
+diff --git a/src/plugPikiNishimura/SnakeAi.cpp b/src/plugPikiNishimura/SnakeAi.cpp
+index f228720..ab0cb70 100644
+--- a/src/plugPikiNishimura/SnakeAi.cpp
++++ b/src/plugPikiNishimura/SnakeAi.cpp
+@@ -444,7 +444,10 @@ void SnakeAi::pikiStickMouth()
+ {
+ 	CollPart* mouth  = mSnake->mCollInfo->getSphere('slot');
+ 	int randStartNum = NsMathI::getRand(mMaxSlotCount);
+-	int partNum;
++	// PC: only set when the scan finds a free mouth slot. If every slot is
++	// taken the loop falls out and getChildAt(partNum) ran on stack garbage —
++	// slot 0 is the deterministic stand-in.
++	int partNum = 0;
+ 	for (int i = 0; i < mMaxSlotCount; i++) {
+ 		if (randStartNum >= mMaxSlotCount) {
+ 			randStartNum = 0;
+diff --git a/src/plugPikiNishimura/genBoss.cpp b/src/plugPikiNishimura/genBoss.cpp
+index 6313802..824f3b9 100644
+--- a/src/plugPikiNishimura/genBoss.cpp
++++ b/src/plugPikiNishimura/genBoss.cpp
+@@ -86,24 +86,32 @@ void GenObjectBoss::ramSaveParameters(RandomAccessStream& output)
+ void GenObjectBoss::readParameters(RandomAccessStream& input)
+ {
+ 	// this is too much compression, just read them as words goddamn it!
+-	union GenFlags {
+-		u32 w;
+-		struct {
+-			u32 m0 : 20;
+-			u32 m1 : 4;
+-			u32 m2 : 2;
+-			u32 m3 : 2;
+-			u32 m4 : 4;
+-		} b;
+-	} flags;
+-
+-	flags.w = input.readInt();
++	//
++	// PC: it was a bitfield union, and BITFIELD ALLOCATION ORDER IS
++	// ENDIANNESS-DEPENDENT. On the GameCube's big-endian ABI the first member
++	// declared (m0) takes the MOST significant bits, so the fields land as
++	//
++	//     m0 = bits 31..12   m1 = 11..8   m2 = 7..6   m3 = 5..4   m4 = 3..0
++	//
++	// Little-endian clang allocates from the LSB instead, so `m4` named the TOP
++	// nibble rather than the bottom one. That nibble is 0 in every real record,
++	// so mBossID read 0 for EVERY boss generator — and GENBOSS_Spider is 0, so
++	// every one of them became a Beady Long Legs. Measured on day 4: five
++	// separate GenObjectBoss records, five sensible map positions, all reporting
++	// genBossID=0, on a map that has no Beady Long Legs at all. They are almost
++	// certainly the map's water and geyser objects (GENBOSS_Mizu 8, _Geyzer 9).
++	//
++	// The value out of readInt() was never the problem; only which bits the
++	// names referred to. Explicit shifts are endianness-proof, which is the same
++	// resolution this port already applied to the .h4m headers and the
++	// sequencer's extendedRegs pair.
++	u32 w = (u32)input.readInt();
+ 
+-	mBossID          = flags.b.m4;
+-	mItemIndex       = flags.b.m3;
+-	mItemColour      = flags.b.m2;
+-	mItemCount       = flags.b.m1;
+-	mPelletConfigIdx = flags.b.m0 - 1;
++	mBossID          = (w >> 0) & 0xF;
++	mItemIndex       = (w >> 4) & 0x3;
++	mItemColour      = (w >> 6) & 0x3;
++	mItemCount       = (w >> 8) & 0xF;
++	mPelletConfigIdx = ((w >> 12) & 0xFFFFF) - 1;
+ }
+ 
+ /**
+diff --git a/src/plugPikiNishimura/nscalculation.cpp b/src/plugPikiNishimura/nscalculation.cpp
+index 1218ac8..92d2b66 100644
+--- a/src/plugPikiNishimura/nscalculation.cpp
++++ b/src/plugPikiNishimura/nscalculation.cpp
+@@ -1,4 +1,5 @@
+ #include "NsMath.h"
++#include "pc_uninit.h"
+ 
+ #include "DebugLog.h"
+ #include "Matrix3f.h"
+@@ -55,6 +56,14 @@ void NsCalculation::calcMatrix(const Vector3f& xVec, const Vector3f& yVec, const
+  * @todo: Documentation
+  * @note UNUSED Size: 00004C (Matching by size)
+  */
++// PC: the [0][3] and [1][3] writes below run off the end of each 3-float row
++// into the next one — [0][3] IS [1][0] in a contiguous f32[3][3]. Audited
++// 2026-07-27 for the -O2 campaign: the decomp is faithful (this is how the
++// function matches by size), the addressing is linear and deterministic, and
++// the function is UNUSED. Suppressed locally so the always-on -Warray-bounds
++// keeps meaning "something new".
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Warray-bounds"
+ void NsCalculation::calcMatrix3f(const Vector3f& vec1, const Vector3f& vec2, const Vector3f& vec3, Matrix3f& mtx)
+ {
+ 	mtx.mMtx[0][0] = vec1.x;
+@@ -67,6 +76,7 @@ void NsCalculation::calcMatrix3f(const Vector3f& vec1, const Vector3f& vec2, con
+ 	mtx.mMtx[1][1] = vec3.y;
+ 	mtx.mMtx[2][0] = vec3.z;
+ }
++#pragma clang diagnostic pop
+ 
+ /**
+  * @todo: Documentation
+@@ -167,6 +177,13 @@ int NsCalculation::calcMtxDirect(const Matrix4f& param_1, const Matrix4f& param_
+ 			maxInnerRatio = innerRatio;
+ 		}
+ 	}
++	// PC probe: `maxIdx` is assigned only alongside a bump to `maxInnerRatio`,
++	// which starts at 0.0f — so "maxInnerRatio is still 0" is an exact test for
++	// "maxIdx was never assigned". Every inner ratio being <= 0 (all three axes
++	// pointing away from the travel direction) returns axis 0 by accident.
++	if (maxInnerRatio == 0.0f) {
++		PC_UNINIT_HIT("nscalculation.cpp:179 maxIdx", maxInnerRatio);
++	}
+ 	return maxIdx;
+ }
+ 
+diff --git a/src/plugPikiOgawa/ogGraph.cpp b/src/plugPikiOgawa/ogGraph.cpp
+index 36b3e20..cfd8651 100644
+--- a/src/plugPikiOgawa/ogGraph.cpp
++++ b/src/plugPikiOgawa/ogGraph.cpp
+@@ -1,4 +1,5 @@
+ #include "zen/ogGraph.h"
++#include "pc_uninit.h"
+ #include "DebugLog.h"
+ #include "GameStat.h"
+ #include "P2D/Graph.h"
+@@ -162,6 +163,14 @@ void ogGraphMgr::MakeData()
+ 					line = LinePointY;
+ 					break;
+ 				}
++				// PC probe: a colour outside {Blue,Red,Yellow} leaves `line` at
++				// the null -ftrivial-auto-var-init gives it, and the hour loop
++				// below writes through it — `line[0] = ...` on a null. This is
++				// the end-of-day results graph, so it is on the day-1 path.
++				// Both of this file's two identical switches share the label.
++				default:
++					PC_UNINIT_HIT("ogGraph.cpp:176 line", color);
++					break;
+ 				}
+ 
+ 				for (hour = start; hour <= end; hour++) {
+@@ -198,6 +207,14 @@ void ogGraphMgr::MakeData()
+ 					line = LinePointY;
+ 					break;
+ 				}
++				// PC probe: a colour outside {Blue,Red,Yellow} leaves `line` at
++				// the null -ftrivial-auto-var-init gives it, and the hour loop
++				// below writes through it — `line[0] = ...` on a null. This is
++				// the end-of-day results graph, so it is on the day-1 path.
++				// Both of this file's two identical switches share the label.
++				default:
++					PC_UNINIT_HIT("ogGraph.cpp:176 line", color);
++					break;
+ 				}
+ 
+ 				for (hour = start; hour <= end; hour++) {
+diff --git a/src/plugPikiOgawa/ogMenu.cpp b/src/plugPikiOgawa/ogMenu.cpp
+index 1325d0b..256b55f 100644
+--- a/src/plugPikiOgawa/ogMenu.cpp
++++ b/src/plugPikiOgawa/ogMenu.cpp
+@@ -152,7 +152,7 @@ bool zen::ogDrawScrMenu::draw(Graphics& gfx)
+ 	P2DPerspGraph graf(0, 0, 640, 480, 30.0f, 1.0f, 5000.0f);
+ 	graf.setPort();
+ 	mScreen->draw(0, 0, &graf);
+-	return /* nothing, because they forgot to. */;
++	return false; /* PC: was `return;` — nothing, because they forgot to. */
+ }
+ 
+ /**
+diff --git a/src/plugPikiYamashita/P2DFont.cpp b/src/plugPikiYamashita/P2DFont.cpp
+index 3808fe3..e438af6 100644
+--- a/src/plugPikiYamashita/P2DFont.cpp
++++ b/src/plugPikiYamashita/P2DFont.cpp
+@@ -142,19 +142,19 @@ f32 P2DFont::drawChar(f32 xPos, f32 yPos, int charCode, int drawWidth, int drawH
+ 	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+ 
+ 	GXPosition3f32(x0, y0, 0.0f);
+-	GXColor1u32(*(u32*)&mTLColour);
++	GXColor1u32(PC_GX_COLOR(mTLColour));
+ 	GXTexCoord2u16(s0, t0);
+ 
+ 	GXPosition3f32(x1, y0, 0.0f);
+-	GXColor1u32(*(u32*)&mTRColour);
++	GXColor1u32(PC_GX_COLOR(mTRColour));
+ 	GXTexCoord2u16(s1, t0);
+ 
+ 	GXPosition3f32(x1, y1, 0.0f);
+-	GXColor1u32(*(u32*)&mBRColour);
++	GXColor1u32(PC_GX_COLOR(mBRColour));
+ 	GXTexCoord2u16(s1, t1);
+ 
+ 	GXPosition3f32(x0, y1, 0.0f);
+-	GXColor1u32(*(u32*)&mBLColour);
++	GXColor1u32(PC_GX_COLOR(mBLColour));
+ 	GXTexCoord2u16(s0, t1);
+ 
+ 	GXEnd();
+diff --git a/src/plugPikiYamashita/P2DPane.cpp b/src/plugPikiYamashita/P2DPane.cpp
+index b1aaa65..2605006 100644
+--- a/src/plugPikiYamashita/P2DPane.cpp
++++ b/src/plugPikiYamashita/P2DPane.cpp
+@@ -180,7 +180,9 @@ P2DPane::P2DPane(P2DPane* parent, RandomAccessStream* input, u16 paneType)
+ 	tag[2] = input->readByte();
+ 	tag[3] = input->readByte();
+ 
+-	mTagName = *(u32*)tag;
++	/* PC: compose big-endian — must equal multi-char literals ('pall' etc.)
++	   regardless of host endianness (fourcc overlay class). */
++	mTagName = ((u32)tag[0] << 24) | ((u32)tag[1] << 16) | ((u32)tag[2] << 8) | (u32)tag[3];
+ 
+ 	mBounds.mMinX = (int)input->readShort();
+ 	mBounds.mMinY = (int)input->readShort();
+@@ -250,6 +252,20 @@ void P2DPane::draw(int xOffs, int yOffs, const P2DGrafContext* grafContext, bool
+ 				context.setScissor();
+ 			}
+ 
++			// PC_PANETRACE: name each visible pane + its 640x480 bounds, so a draw
++			// in the GPU/seg capture can be matched to a .blo pane by position.
++			if (getenv("PC_PANETRACE")) {
++				static u32 seen[256]; static int nseen;
++				u32 k = mTagName;
++				bool dup = false;
++				for (int s = 0; s < nseen; s++) if (seen[s] == k) { dup = true; break; }
++				if (!dup && nseen < 256) {
++					seen[nseen++] = k;
++					fprintf(stderr, "[PANE] tag=%c%c%c%c bounds=(%d,%d..%d,%d)\n",
++					        (char)(mTagName >> 24), (char)(mTagName >> 16), (char)(mTagName >> 8), (char)mTagName,
++					        mBounds.mMinX, mBounds.mMinY, mBounds.mMaxX, mBounds.mMaxY);
++				}
++			}
+ 			GXSetCullMode((GXCullMode)mCullMode);
+ 			drawSelf(xOffs, yOffs, &context.mViewMtx);
+ 			if (mCallBack) {
+diff --git a/src/plugPikiYamashita/P2DPrint.cpp b/src/plugPikiYamashita/P2DPrint.cpp
+index 3fbdf2f..3eea86f 100644
+--- a/src/plugPikiYamashita/P2DPrint.cpp
++++ b/src/plugPikiYamashita/P2DPrint.cpp
+@@ -181,7 +181,7 @@ f32 P2DPrint::parse(const u8* textBuffer, int textLen, int maxWidth, u16* outXPo
+ 
+ 	while (true) {
+ 		bool isDrawableChar = true;
+-		if (currChar == 0 || (u32)textBuffer - (u32)textStart > textLen) {
++		if (currChar == 0 || (uintptr_t)textBuffer - (uintptr_t)textStart > textLen) {
+ 			if (!doDraw && outXPosBuffer) {
+ 				outXPosBuffer[charNum] = (currLineWidth + 0.5f);
+ 			}
+@@ -218,7 +218,7 @@ f32 P2DPrint::parse(const u8* textBuffer, int textLen, int maxWidth, u16* outXPo
+ 			bool isMultiByteChar = false;
+ 			if (mFont->getFontType() == OS_FONT_ENCODE_SJIS) {
+ 				currChar = (currChar << 8) | *textBuffer++;
+-				if ((u32)textBuffer - (u32)textStart <= textLen) {
++				if ((uintptr_t)textBuffer - (uintptr_t)textStart <= textLen) {
+ 					isMultiByteChar = true;
+ 				} else {
+ 					continue;
+@@ -229,7 +229,7 @@ f32 P2DPrint::parse(const u8* textBuffer, int textLen, int maxWidth, u16* outXPo
+ 			} else if (mFont->getFontType() == OS_FONT_ENCODE_UNK2 && currChar >= ASCII_PRINTABLE_MAX && *textBuffer != 0) {
+ #endif
+ 				currChar = (currChar << 8) | *textBuffer++;
+-				if ((u32)textBuffer - (u32)textStart <= textLen) {
++				if ((uintptr_t)textBuffer - (uintptr_t)textStart <= textLen) {
+ 					isMultiByteChar = true;
+ 				} else {
+ 					continue;
+@@ -511,7 +511,12 @@ s32 P2DPrint::getNumber(const u8** strPtr, s32 defaultValue, s32 invalidValue, i
+ 
+ 	(*strPtr)++;
+ 	value = 0;
+-	char* endStr;
++	// PC: strtol/strtoul set this, but only for base 10 and 16, and `endStr[0]`
++	// below is read unconditionally. Every caller passes 10 or 16, so the gap
++	// is unreachable today; pointing it at the current cursor means an
++	// unsupported base degrades to "no number here" instead of dereferencing
++	// whatever the stack held.
++	char* endStr = (char*)*strPtr;
+ 
+ 	if (base == 10) { // base 10, we're expecting a straight value
+ 		value = strtol((char*)*strPtr, &endStr, base);
+@@ -520,9 +525,9 @@ s32 P2DPrint::getNumber(const u8** strPtr, s32 defaultValue, s32 invalidValue, i
+ 		value = strtoul((char*)*strPtr, &endStr, base);
+ 
+ 		// RBGA is valid length 8 format.
+-		if ((u32)endStr - (u32)*strPtr != 8) {
++		if ((uintptr_t)endStr - (uintptr_t)*strPtr != 8) {
+ 			// only other valid format is RGB, length 6.
+-			if ((u32)endStr - (u32)*strPtr == 6) {
++			if ((uintptr_t)endStr - (uintptr_t)*strPtr == 6) {
+ 				value = (value << 8) | 0xFF; // set alpha to max
+ 			} else {
+ 				// invalid format!
+diff --git a/src/plugPikiYamashita/P2DScreen.cpp b/src/plugPikiYamashita/P2DScreen.cpp
+index 2a2ecd5..f5e768c 100644
+--- a/src/plugPikiYamashita/P2DScreen.cpp
++++ b/src/plugPikiYamashita/P2DScreen.cpp
+@@ -90,6 +90,7 @@ void P2DScreen::makeHiearachyPanes(P2DPane* parent, RandomAccessStream* input, b
+ 	P2DPane* currPane = parent;
+ 	while (true) {
+ 		u16 paneType = input->readShort();
++		if (getenv("PC_VERBOSE")) fprintf(stderr, "[P2D] paneType=%04x pos=%d\n", paneType, input->getPosition()); /* PC probe */
+ 		switch (paneType) {
+ 		case PANETYPE_Unk0:
+ 		{
+diff --git a/src/plugPikiYamashita/P2DWindow.cpp b/src/plugPikiYamashita/P2DWindow.cpp
+index 4a55d76..464a524 100644
+--- a/src/plugPikiYamashita/P2DWindow.cpp
++++ b/src/plugPikiYamashita/P2DWindow.cpp
+@@ -204,19 +204,19 @@ void P2DWindow::drawContents(const PUTRect& windowBounds)
+ 
+ 		// top left
+ 		GXPosition3s16(windowBounds.mMinX, windowBounds.mMinY, 0);
+-		GXColor1u32(*(u32*)&mTLCornerColour);
++		GXColor1u32(PC_GX_COLOR(mTLCornerColour));
+ 
+ 		// top right
+ 		GXPosition3s16(windowBounds.mMaxX, windowBounds.mMinY, 0);
+-		GXColor1u32(*(u32*)&mTRCornerColour);
++		GXColor1u32(PC_GX_COLOR(mTRCornerColour));
+ 
+ 		// bottom right
+ 		GXPosition3s16(windowBounds.mMaxX, windowBounds.mMaxY, 0);
+-		GXColor1u32(*(u32*)&mBRCornerColour);
++		GXColor1u32(PC_GX_COLOR(mBRCornerColour));
+ 
+ 		// bottom left
+ 		GXPosition3s16(windowBounds.mMinX, windowBounds.mMaxY, 0);
+-		GXColor1u32(*(u32*)&mBLCornerColour);
++		GXColor1u32(PC_GX_COLOR(mBLCornerColour));
+ 	}
+ }
+ 
+diff --git a/src/plugPikiYamashita/TAIAmove.cpp b/src/plugPikiYamashita/TAIAmove.cpp
+index 2c4b1c7..5b78124 100644
+--- a/src/plugPikiYamashita/TAIAmove.cpp
++++ b/src/plugPikiYamashita/TAIAmove.cpp
+@@ -652,12 +652,18 @@ void TAIApatrol::setTargetPosition(Teki& teki)
+ void TAIApatrol::start(Teki& teki)
+ {
+ 	teki.setTableIndex(0);
++	// PC: minDist was declared INSIDE the loop, so `minDist = sum` on the first
++	// iteration was thrown away and every later `sum > minDist` compared
++	// against a fresh uninitialised slot. On PPC that read the same stack slot
++	// each time round, which is what makes the i==0 seed work at all — MWCC
++	// allocates the frame once, not per iteration. Hoisting the declaration is
++	// what reproduces that; a loop-local cannot.
++	f32 minDist = 0.0f;
+ 	for (int i = 0; i < _1C; i++) {
+ 		setTargetPosition(teki);
+ 
+ 		f32 sum = zen::Abs(teki.getPosition().x - teki.mTargetPosition.x) + zen::Abs(teki.getPosition().y - teki.mTargetPosition.y)
+ 		        + zen::Abs(teki.getPosition().z - teki.mTargetPosition.z);
+-		f32 minDist;
+ 		if (i == 0) {
+ 			minDist = sum;
+ 		} else if (sum > minDist) {
+diff --git a/src/plugPikiYamashita/TAIbeatle.cpp b/src/plugPikiYamashita/TAIbeatle.cpp
+index 87c4372..8ecb6b5 100644
+--- a/src/plugPikiYamashita/TAIbeatle.cpp
++++ b/src/plugPikiYamashita/TAIbeatle.cpp
+@@ -1,4 +1,5 @@
+ #include "TAI/Beatle.h"
++#include "pc_uninit.h"
+ 
+ #include "DebugLog.h"
+ #include "Pcam/CameraManager.h"
+@@ -323,6 +324,11 @@ protected:
+ 			}
+ 			default:
+ 			{
++				// PC probe: this `default:` reports but does not assign, so
++				// `steamEffectPart` stays at the null -ftrivial-auto-var-init
++				// gives it. The `!= nullptr` check below then makes that safe —
++				// safER than retail, which would have dereferenced stack residue.
++				PC_UNINIT_HIT("TAIbeatle.cpp:331 steamEffectPart", 0);
+ 				ERROR("illegal index");
+ 				break;
+ 			}
+diff --git a/src/plugPikiYamashita/alphaWipe.cpp b/src/plugPikiYamashita/alphaWipe.cpp
+index 319a2f4..19ae8d7 100644
+--- a/src/plugPikiYamashita/alphaWipe.cpp
++++ b/src/plugPikiYamashita/alphaWipe.cpp
+@@ -1,4 +1,5 @@
+ #include "zen/AlphaWipe.h"
++#include "pc_uninit.h"
+ #include "DebugLog.h"
+ #include "Graphics.h"
+ #include "zen/Math.h"
+@@ -78,6 +79,15 @@ void zen::AlphaWipe::update()
+ 				mState = STATE_Inactive;
+ 			}
+ 		}
++		// PC probe: census -Wconditional-uninitialized (`startAlpha`,
++		// `endAlpha`). Both are assigned only on these two arms, but the switch
++		// below reads them unconditionally — so an active wipe with NEITHER
++		// direction flag set writes the zero -ftrivial-auto-var-init leaves,
++		// i.e. a fully transparent wipe. Reached on every screen transition, so
++		// the gates cover it well.
++		else {
++			PC_UNINIT_HIT("alphaWipe.cpp:85 startAlpha/endAlpha", mFlags);
++		}
+ 
+ 		switch (mWipeType) {
+ 		case TYPE_Normal:
+diff --git a/src/plugPikiYamashita/bBoardColourAnim.cpp b/src/plugPikiYamashita/bBoardColourAnim.cpp
+index 6340d59..a34188b 100644
+--- a/src/plugPikiYamashita/bBoardColourAnim.cpp
++++ b/src/plugPikiYamashita/bBoardColourAnim.cpp
+@@ -31,6 +31,24 @@ static inline void bBoard_readFloatArray(f32** outArray, u8*& data, u32 size)
+ 	}
+ }
+ 
++// The float array aliases the BIG-ENDIAN effect blob (raw pointer, no copy) —
++// swap on read for PC, same pattern as pmIntpManual/pmIntpLinear in
++// particleGenerator (fixing in place would double-swap a re-parsed template).
++// Unswapped thresholds made the colour-anim ratio t garbage (only clamped
++// above 1), overflowing the u8 lerp into junk prim/env colours — the opening
++// scene's light-ray flood and glitchy billboard particle colours.
++static inline f32 bBoard_frameThreshold(const f32* arr, int idx)
++{
++#ifdef TARGET_PC
++	union { u32 u; f32 f; } v;
++	const u8* p = (const u8*)(arr + idx);
++	v.u = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
++	return v.f;
++#else
++	return arr[idx];
++#endif
++}
++
+ static inline void bBoard_readColourArray(Colour** outVal, u8*& data, u32 size)
+ {
+ 	*outVal = (Colour*)data;
+@@ -63,6 +81,24 @@ void zen::bBoardColourAnimData::set(u8* data)
+ 		bBoard_readFloatArray(&mFrameThresholds, data, mMaxFrame);
+ 		bBoard_readColourArray(&mPrimColors, data, mMaxFrame);
+ 		bBoard_readColourArray(&mEnvColors, data, mMaxFrame);
++#ifdef TARGET_PC
++		// PC_PTCL_TRACE: sanity-print each distinct colour anim once — swapped
++		// thresholds must be monotonic 0..1 or the swap/layout theory is wrong.
++		if (getenv("PC_PTCL_TRACE")) {
++			static const void* seen[64]; static int nseen;
++			bool dup = false;
++			for (int i = 0; i < nseen; i++) if (seen[i] == (void*)mFrameThresholds) { dup = true; break; }
++			if (!dup && nseen < 64 && mMaxFrame) {
++				seen[nseen++] = (void*)mFrameThresholds;
++				fprintf(stderr, "[BBANIM] blend=%d dur=%d flags=0x%x frames=%d thr=", mBlendMode, mDuration, mFlags.all, mMaxFrame);
++				for (int i = 0; i < mMaxFrame && i < 6; i++)
++					fprintf(stderr, "%.3f,", bBoard_frameThreshold(mFrameThresholds, i));
++				fprintf(stderr, " prim0=(%d,%d,%d,%d) env0=(%d,%d,%d,%d)\n",
++				        mPrimColors[0].r, mPrimColors[0].g, mPrimColors[0].b, mPrimColors[0].a,
++				        mEnvColors[0].r, mEnvColors[0].g, mEnvColors[0].b, mEnvColors[0].a);
++			}
++		}
++#endif
+ 	}
+ }
+ 
+@@ -71,13 +107,21 @@ void zen::bBoardColourAnimData::set(u8* data)
+  */
+ void zen::bBoardColourAnim::update(f32 timeStep, Colour* primColor, Colour* envColor)
+ {
+-	f32 currThresh = (mDuration - 1) * mAnimData->mFrameThresholds[mCurrentFrame];
+-	f32 nextThresh = (mDuration - 1) * mAnimData->mFrameThresholds[mCurrentFrame + 1];
++	f32 currThresh = (mDuration - 1) * bBoard_frameThreshold(mAnimData->mFrameThresholds, mCurrentFrame);
++	f32 nextThresh = (mDuration - 1) * bBoard_frameThreshold(mAnimData->mFrameThresholds, mCurrentFrame + 1);
+ 	f32 t          = (mProgress - currThresh) / (nextThresh - currThresh);
+ 
+ 	if (t > 1.0f) {
+ 		t = 1.0f;
+ 	}
++#ifdef TARGET_PC
++	// GC data guarantees monotonic thresholds so t never goes negative; any
++	// port-side progression slip would wrap the u8 colour lerp (strobing).
++	// Also guard a zero/denormal threshold span (t = inf/NaN).
++	if (!(t >= 0.0f)) {
++		t = 0.0f;
++	}
++#endif
+ 
+ 	bBoard_lerpColor(primColor, &mAnimData->mPrimColors[mCurrentFrame], 1.0f - t, &mAnimData->mPrimColors[mCurrentFrame + 1], t);
+ 	bBoard_lerpColor(envColor, &mAnimData->mEnvColors[mCurrentFrame], 1.0f - t, &mAnimData->mEnvColors[mCurrentFrame + 1], t);
+diff --git a/src/plugPikiYamashita/damageEffect.cpp b/src/plugPikiYamashita/damageEffect.cpp
+index 03d400d..c5be063 100644
+--- a/src/plugPikiYamashita/damageEffect.cpp
++++ b/src/plugPikiYamashita/damageEffect.cpp
+@@ -17,7 +17,12 @@ zen::DamageEffect::DamageEffect()
+ bool zen::DamageEffect::update()
+ {
+ 	if (!gameflow.mIsUIOverlayActive) {
+-		Navi* navi;
++		// PC: the guard covers the fetch but not the use below — see the
++		// decomp's own "// hmm." on that line. Retail read stack garbage when
++		// naviMgr was null; nullptr at least makes the fault immediate and
++		// obvious. naviMgr is non-null for the whole of a normal session, so
++		// this path has never been observed.
++		Navi* navi = nullptr;
+ 		if (naviMgr) {
+ 			navi = naviMgr->getNavi(0);
+ 		}
+diff --git a/src/plugPikiYamashita/drawMenuBase.cpp b/src/plugPikiYamashita/drawMenuBase.cpp
+index de35dc4..bbd2c41 100644
+--- a/src/plugPikiYamashita/drawMenuBase.cpp
++++ b/src/plugPikiYamashita/drawMenuBase.cpp
+@@ -167,6 +167,10 @@ bool zen::DrawMenuBase::modeOperation(Controller* controller)
+ 		mMenuItems[i].update(i == mCurrentHover, mCharColor, mGradColor);
+ 	}
+ 
++	// Census -Wconditional-uninitialized (`newItem`): AUDITED NON-BUG.
++	// `newItem` is assigned only inside `if (selAdjust)`, and mCurrentHover is
++	// only ever CHANGED inside that same block — so `startSel != mCurrentHover`
++	// cannot be true unless that block ran. Correlated guard.
+ 	if (startSel != mCurrentHover) {
+ 		SeSystem::playSysSe(SYSSE_MOVE1);
+ 		mLeftCursorMgr.move(newItem->getIconLPosH(), newItem->getIconLPosV(), 0.5f);
+diff --git a/src/plugPikiYamashita/particleGenerator.cpp b/src/plugPikiYamashita/particleGenerator.cpp
+index 0326b32..6265d57 100644
+--- a/src/plugPikiYamashita/particleGenerator.cpp
++++ b/src/plugPikiYamashita/particleGenerator.cpp
+@@ -1,4 +1,5 @@
+ #include "DebugLog.h"
++#include "pc_uninit.h"
+ #include "Graphics.h"
+ #include "Matrix3f.h"
+ #include "zen/particle.h"
+@@ -15,30 +16,64 @@ DEFINE_ERROR(29)
+  */
+ DEFINE_PRINT("particleGenerator")
+ 
++#ifdef TARGET_PC
++/* PC: this table is S16 XYZ quad corners (±25) authored as BIG-ENDIAN bytes
++   (0xFFE7=-25, 0x0019=+25). The GX shim reads GXSetArray sources native-endian
++   (they are otherwise all runtime structures), so on LE each pair must be
++   pre-swapped or the corners decode as ±6145/±6400 — screen-covering quads
++   (the intro white-flood). Same values, LE byte order: */
++static u8 lpsPos[48] ATTRIBUTE_ALIGN(32) = {
++	231, 255, 25, 0, 0,   0,   25, 0, 25, 0, 0, 0,  25, 0, 231, 255, 0, 0,  231, 255, 231, 255, 0,   0,
++	0,   0,   25, 0, 231, 255, 0,  0, 25, 0, 25, 0, 0,  0, 231, 255, 25, 0, 0,   0,   231, 255, 231, 255,
++};
++#else
+ static u8 lpsPos[48] ATTRIBUTE_ALIGN(32) = {
+ 	255, 231, 0, 25, 0,   0,   0, 25, 0, 25, 0, 0,  0, 25, 255, 231, 0, 0,  255, 231, 255, 231, 0,   0,
+ 	0,   0,   0, 25, 255, 231, 0, 0,  0, 25, 0, 25, 0, 0,  255, 231, 0, 25, 0,   0,   255, 231, 255, 231,
+ };
++#endif
+ 
+ static u8 lpsCoord[8] ATTRIBUTE_ALIGN(32) = {
+ 	0, 0, 1, 0, 1, 1, 0, 1,
+ };
+ 
++/* PC: the DDF effect blob is a serialized big-endian on-disc format read via
++   raw pointer casts. On little-endian every multi-byte field must be swapped,
++   else particle flags decode wrong (misaligning the conditional field reads)
++   and scalar params (emission rate, lifetime) come out as garbage — a wrong
++   emission rate spins the SetPtclsLife spawn loop billions of times. Single
++   bytes (readDDF_U8/Colour) are already endian-safe. */
++#ifdef TARGET_PC
++static inline u32 pc_ddf_u32(const u8* p) { return __builtin_bswap32(*(const u32*)p); }
++static inline u16 pc_ddf_u16(const u8* p) { return __builtin_bswap16(*(const u16*)p); }
++#else
++static inline u32 pc_ddf_u32(const u8* p) { return *(const u32*)p; }
++static inline u16 pc_ddf_u16(const u8* p) { return *(const u16*)p; }
++#endif
++
++// readDDF_FloatArray stores a pointer straight into the big-endian DDF buffer
++// rather than copying, so its floats are never swapped in place (mutating the
++// shared resource would double-swap when a template is parsed more than once).
++// Read those arrays through this accessor instead — swap-on-read, identity on
++// GC. Every consumer of a readDDF_FloatArray array goes through pmIntpManual/
++// pmIntpLinear, so swapping there covers all of them.
++static inline f32 pc_ddf_farr(const f32* a, int i) { return u32ToFloat(pc_ddf_u32((const u8*)(a + i))); }
++
+ static inline void readDDF_U32(u32* outVal, u8*& data, u32 size)
+ {
+-	*outVal = *((u32*)data);
++	*outVal = pc_ddf_u32(data);
+ 	data += size;
+ }
+ 
+ static inline void readDDF_Vector(Vector3f* outVec, u8*& data)
+ {
+-	outVec->set(u32ToFloat(((u32*)data)[0]), u32ToFloat(((u32*)data)[1]), u32ToFloat(((u32*)data)[2]));
++	outVec->set(u32ToFloat(pc_ddf_u32(data)), u32ToFloat(pc_ddf_u32(data + 4)), u32ToFloat(pc_ddf_u32(data + 8)));
+ 	data += sizeof(Vector3f);
+ }
+ 
+ static inline void readDDF_Float(f32* outVal, u8*& data, u32 size)
+ {
+-	*outVal = u32ToFloat(((u32*)data)[0]);
++	*outVal = u32ToFloat(pc_ddf_u32(data));
+ 	data += size;
+ }
+ 
+@@ -58,7 +93,7 @@ static inline void readDDF_FloatArray(f32** outArray, u8*& data, u32 size)
+ 
+ static inline void readDDF_Short(s16* outVal, u8*& data, u32 size)
+ {
+-	*outVal = *(s16*)data;
++	*outVal = (s16)pc_ddf_u16(data);
+ 	data += size;
+ }
+ 
+@@ -93,15 +128,59 @@ void zen::particleGenerator::init(u8* data, Texture* tex1, Texture* tex2, immut
+ 			mDrawCallBack = &particleGenerator::drawPtclBillboard;
+ 		} else {
+ 			STACK_PAD_VAR(1);
++			// These two raw reads are big-endian bugs on PC (LE decodes them
++			// as denormals ≈ 0). The draw-path bug that made the correct
++			// decode look WORSE (lpsPos read LE → ±6145-unit quads, the
++			// intro white-flood) is fixed, so the correct BE decode is now
++			// the default; PC_ORIENT_FIX=0 reverts to the broken decode for A/B.
++#ifdef TARGET_PC
++			static int s_orient_fix = -1;
++			if (s_orient_fix < 0) {
++				const char* e = getenv("PC_ORIENT_FIX");
++				s_orient_fix  = e ? atoi(e) : 1;
++			}
++			if (s_orient_fix) {
++				mLengthScale  = u32ToFloat(pc_ddf_u32(data + 8));
++				mPivotOffsetY = u32ToFloat(pc_ddf_u32(data + 12));
++				if (getenv("PC_PTCL_TRACE"))
++					fprintf(stderr, "[ORIENT] gen=%p lenScale=%g pivotY=%g\n", (void*)this, mLengthScale, mPivotOffsetY);
++			} else {
++				mLengthScale  = u32ToFloat(((u32*)data)[2]);
++				mPivotOffsetY = u32ToFloat(((u32*)data)[3]);
++			}
++#else
+ 			mLengthScale  = u32ToFloat(((u32*)data)[2]);
+ 			mPivotOffsetY = u32ToFloat(((u32*)data)[3]);
++#endif
+ 			mAnimData.set(&data[16]);
+ 
+ 			static_cast<bool>(data);
+ 
+-			u32 rotType                            = mAnimData.mFlags.bits.mRotationType & 0x7;
+-			mOrientedDrawConfig.mOrientationSource = mAnimData.mFlags.bits.mOrientationSource;
+-			mOrientedDrawConfig.mIsDoubleSided     = mAnimData.mFlags.bits.mIsDoubleSided;
++			u32 rotType;
++#ifdef TARGET_PC
++			// MWERKS packs bitfields MSB-first, clang LSB-first. USER-VERIFIED
++			// (2026-07-25, warp scene): the MSB decode is CORRECT — with the
++			// clang view most oriented ribbons got a wrong rotType/spin axis
++			// and presented edge-on as crisp lines; MSB restores GC's fat
++			// soft beams. Default ON; PC_BITMSB=0 reverts to the clang view
++			// for A/B. Bit positions: bit7 _m0 | 6-4 rotType | 3 _m4 |
++			// 2 orientSrc | 1 dblSided | 0 _m7.
++			static int s_bitmsb = -1;
++			if (s_bitmsb < 0) {
++				const char* e = getenv("PC_BITMSB");
++				s_bitmsb      = e ? atoi(e) : 1;
++			}
++			if (s_bitmsb) {
++				rotType                                = (mAnimData.mFlags.all >> 4) & 0x7;
++				mOrientedDrawConfig.mOrientationSource = (mAnimData.mFlags.all >> 2) & 0x1;
++				mOrientedDrawConfig.mIsDoubleSided     = (mAnimData.mFlags.all >> 1) & 0x1;
++			} else
++#endif
++			{
++				rotType                                = mAnimData.mFlags.bits.mRotationType & 0x7;
++				mOrientedDrawConfig.mOrientationSource = mAnimData.mFlags.bits.mOrientationSource;
++				mOrientedDrawConfig.mIsDoubleSided     = mAnimData.mFlags.bits.mIsDoubleSided;
++			}
+ 			mOrientedDrawConfig.mFlipNormal        = 0;
+ 			mAnimData.mFlags.all &= 0x1;
+ 			mDrawCallBack = &particleGenerator::drawPtclOriented;
+@@ -152,7 +231,11 @@ void zen::particleGenerator::init(u8* data, Texture* tex1, Texture* tex2, immut
+ 			}
+ 		}
+ 
+-		pmSetDDF(&data[((u16*)data)[2]]);
++		// PC: the DDF-block offset is a big-endian u16 at data[4..5]; read raw
++		// it byte-swaps and points pmSetDDF at garbage. (The rest of this init
++		// blob + AnimData::set still need a full big-endian audit — tracked
++		// separately; the spawn clamp in SetPtclsLife guards the interim.)
++		pmSetDDF(&data[pc_ddf_u16(data + 4)]);
+ 		mMdlMgr  = mdlMgr;
+ 		mEmitPos = pos;
+ 		setCallBack(cb1, cb2);
+@@ -387,10 +470,10 @@ void zen::particleGenerator::pmSetDDF(u8* data)
+ f32 zen::particleGenerator::pmIntpManual(f32* frameThresholds, f32* values)
+ {
+ 	int i;
+-	for (i = 1; mCurrentFrame > mMaxFrame * frameThresholds[i]; i++) {
++	for (i = 1; mCurrentFrame > mMaxFrame * pc_ddf_farr(frameThresholds, i); i++) {
+ 		;
+ 	}
+-	return values[i - 1];
++	return pc_ddf_farr(values, i - 1);
+ }
+ 
+ /**
+@@ -401,11 +484,14 @@ f32 zen::particleGenerator::pmIntpLinear(f32* frameThresholds, f32* values)
+ {
+ 	int i;
+ 	f32 ratio = f32(mCurrentFrame) / f32(mMaxFrame);
+-	for (i = 1; ratio > frameThresholds[i]; i++) {
++	for (i = 1; ratio > pc_ddf_farr(frameThresholds, i); i++) {
+ 		;
+ 	}
+-	return (values[i] * (ratio - frameThresholds[i - 1]) + values[i - 1] * (frameThresholds[i] - ratio))
+-	     / (frameThresholds[i] - frameThresholds[i - 1]);
++	f32 t0 = pc_ddf_farr(frameThresholds, i - 1);
++	f32 t1 = pc_ddf_farr(frameThresholds, i);
++	f32 v0 = pc_ddf_farr(values, i - 1);
++	f32 v1 = pc_ddf_farr(values, i);
++	return (v1 * (ratio - t0) + v0 * (t1 - ratio)) / (t1 - t0);
+ }
+ 
+ /**
+@@ -434,6 +520,21 @@ void zen::particleGenerator::SetPtclsLife()
+ 	mPartialParticleCount = mPartialParticleCount - max;
+ 
+ 	(void)max;
++#ifdef TARGET_PC
++	// PC: defensive clamp — a still-unswapped effect field (see init) can hand
++	// us a garbage emission rate that would spin this spawn loop billions of
++	// times and freeze the game. No real generator emits anywhere near this per
++	// frame; bound it so one bad effect can't hang the whole port.
++	if (!(max >= 0 && max <= 4096)) {
++		static int s_warned;
++		if (s_warned < 8) {
++			s_warned++;
++			fprintf(stderr, "[PTCL] clamped spawn count %d (rate=%.3g) — effect DDF likely needs BE swap\n", max, a);
++		}
++		max                   = (max < 0) ? 0 : 4096;
++		mPartialParticleCount = 0.0f;
++	}
++#endif
+ 	for (i = 0; i < max; i++) {
+ 		particleMdl* ptcl = pmGetParticle();
+ 		if (ptcl) {
+@@ -964,6 +1065,25 @@ void zen::particleGenerator::drawPtclBillboard(Graphics& gfx)
+ 			Colour col(ptcl->mPrimaryColor.r, ptcl->mPrimaryColor.g, ptcl->mPrimaryColor.b,
+ 			           RoundOff(ptcl->mPrimaryColor.a * ptcl->mAlphaFactor));
+ 			gfx.setPrimEnv(&col, &ptcl->mEnvColor);
++#ifdef TARGET_PC
++			// PC_PTCL_TRACE: flag runaway billboard sizes (the intro-crash white
++			// flood was giant additive fire quads) with their inputs, once per
++			// generator, so the garbage FIELD is identifiable.
++			if (getenv("PC_PTCL_TRACE")) {
++				f32 pcSz = ptcl->mSize * ptcl->mScaleFactor * 25.0f;
++				static const void* seen[32]; static int nseen;
++				if (pcSz > 500.0f) {
++					bool dup = false;
++					for (int si = 0; si < nseen; si++) if (seen[si] == (void*)this) { dup = true; break; }
++					if (!dup && nseen < 32) {
++						seen[nseen++] = (void*)this;
++						fprintf(stderr, "[PTCLSZ] gen=%p size=%.1f (mSize=%.2f scaleFac=%.2f) scaleSize=%.2f jit=%.2f thr=(%.2f,%.2f) minf=(%.2f,%.2f) life=%d\n",
++						        (void*)this, pcSz, ptcl->mSize, ptcl->mScaleFactor, mScaleSize, mSizeJitter,
++						        mScaleThreshold1, mScaleThreshold2, mMinScaleFactor1, mMinScaleFactor2, (int)mBaseLifetime);
++					}
++				}
++			}
++#endif
+ 			gfx.drawRotParticle(*gfx.mCamera, ptcl->mLocalPosition + ptcl->mGlobalPosition, -ptcl->mRotAngle,
+ 			                    ptcl->mSize * ptcl->mScaleFactor * 25.0f);
+ 
+@@ -1017,11 +1137,46 @@ void zen::particleGenerator::drawPtclOriented(Graphics& gfx)
+ 		particleMdl* ptcl = (particleMdl*)list;
+ 
+ 		col.set(ptcl->mPrimaryColor.r, ptcl->mPrimaryColor.g, ptcl->mPrimaryColor.b, RoundOff(ptcl->mPrimaryColor.a * ptcl->mAlphaFactor));
++#ifndef TARGET_PC
+ 		gfx.setPrimEnv(&col, &ptcl->mEnvColor);
++#endif
++		// PC: setPrimEnv deferred until after the orientation matrix is
++		// built, so alpha can be scaled by the ribbon's facing (below).
+ 
+ 		MTXIdentity(mtx2);
+ 
+ 		f32 a  = ptcl->mSize * ptcl->mScaleFactor;
++#ifdef TARGET_PC
++		if (getenv("PC_PTCL_TRACE")) { // oversized ORIENTED quads: dump inputs once/gen
++			// [ORIENTW]: ACTUAL width/length scales, first sample per gen, no
++			// threshold — quad is +/-25 units x these. Tiny `a` = ribbons only
++			// pixels wide on screen = "crisp lines" (soft texture has no room)
++			// = the warp look; compare against Dolphin's fat soft beams.
++			{
++				static const void* wseen[32]; static int wnseen;
++				bool wdup = false;
++				for (int si = 0; si < wnseen; si++) if (wseen[si] == (void*)this) { wdup = true; break; }
++				if (!wdup && wnseen < 32) {
++					wseen[wnseen++] = (void*)this;
++					fprintf(stderr, "[ORIENTW] gen=%p a=%.3f v=%.3f (mSize=%.3f scaleFac=%.3f lenScale=%.3f) pos=(%.0f,%.0f,%.0f)\n",
++					        (void*)this, a, a * mLengthScale, ptcl->mSize, ptcl->mScaleFactor, mLengthScale,
++					        ptcl->mLocalPosition.x + ptcl->mGlobalPosition.x, ptcl->mLocalPosition.y + ptcl->mGlobalPosition.y,
++					        ptcl->mLocalPosition.z + ptcl->mGlobalPosition.z);
++				}
++			}
++			static const void* oseen[32]; static int onseen;
++			f32 ov = a * mLengthScale;
++			if ((ov > 500.0f || a > 500.0f)) {
++				bool dup = false;
++				for (int si = 0; si < onseen; si++) if (oseen[si] == (void*)this) { dup = true; break; }
++				if (!dup && onseen < 32) {
++					oseen[onseen++] = (void*)this;
++					fprintf(stderr, "[ORIENTSZ] gen=%p a=%.2f v=%.2f (mSize=%.2f scaleFac=%.2f lenScale=%.2f) scaleSize=%.2f\n",
++					        (void*)this, a, ov, ptcl->mSize, ptcl->mScaleFactor, mLengthScale, mScaleSize);
++				}
++			}
++		}
++#endif
+ 		cosVal = cosShort(ptcl->mRotAngle);
+ 		sinVal = sinShort(ptcl->mRotAngle);
+ 		(this->*mRotAxisCallBack)(mtx3, sinVal, cosVal);
+@@ -1042,6 +1197,20 @@ void zen::particleGenerator::drawPtclOriented(Graphics& gfx)
+ 			vec = &ptcl->mLocalPosition;
+ 			break;
+ 		}
++		// PC probe: mOrientationSource comes from the particle config. Anything
++		// but 0 or 1 leaves `vec` at the null -ftrivial-auto-var-init gives it
++		// and `vec->x` below dereferences it.
++		default:
++			PC_UNINIT_HIT("particleGenerator.cpp:1201 vec", mOrientedDrawConfig.mOrientationSource);
++			// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++			// already zeroes this variable at its declaration and nothing assigns it on the
++			// path that reaches here, so this writes the value that is already there. It is
++			// present because adding a `default:` label PROMOTES the diagnostic from
++			// -Wconditional-uninitialized (not in the always-on set) to
++			// -Wsometimes-uninitialized (which is), and this branch must not spend the
++			// clean-build property to buy instrumentation.
++			vec = nullptr;
++			break;
+ 		}
+ 
+ 		vec1.x = vec->x;
+@@ -1095,6 +1264,36 @@ void zen::particleGenerator::drawPtclOriented(Graphics& gfx)
+ 		MTXConcat(mtx2, mtx3, mtx2);
+ 		MTXConcat(mtx1.mMtx, mtx2, mtx1.mMtx);
+ 
++#ifdef TARGET_PC
++		// SUPERSEDED COMPENSATION, default OFF (PC_ORIENT_FACING=1 re-enables
++		// for A/B): fading edge-on ribbons by |cos(normal,view)| was a guess
++		// at why GC shows soft glow where we drew crisp hairlines. The real
++		// missing feature was MIPMAPS: GC samples these ribbons' textures at
++		// deep, heavily blurred mip levels (GX_LIN_MIP_LIN), which the shim
++		// now implements — that, not rasterizer dropout, is the class.
++		{
++			static int s_facing = -1;
++			if (s_facing < 0) s_facing = getenv("PC_ORIENT_FACING") ? 1 : 0;
++			if (s_facing) {
++				// mtx1 = lookAt*trans*(basis*rot): column 2 of the 3x3 is the
++				// quad normal in VIEW space (scaled), column 3 the view pos.
++				f32 nx = mtx1.mMtx[0][2], ny = mtx1.mMtx[1][2], nz = mtx1.mMtx[2][2];
++				f32 px = mtx1.mMtx[0][3], py = mtx1.mMtx[1][3], pz = mtx1.mMtx[2][3];
++				f32 nl = std::sqrtf(nx * nx + ny * ny + nz * nz);
++				f32 pl = std::sqrtf(px * px + py * py + pz * pz);
++				if (nl > 0.0f && pl > 0.0f) {
++					f32 facing = (nx * px + ny * py + nz * pz) / (nl * pl);
++					if (facing < 0.0f) facing = -facing;
++					// Only the last stretch to edge-on goes sub-pixel on GC;
++					// mid-angle ribbons drew at full strength there (a linear
++					// fade shrank the whole burst — user-verified too small).
++					f32 fade = facing * 4.0f;
++					if (fade < 1.0f) col.a = (u8)RoundOff(col.a * fade);
++				}
++			}
++		}
++		gfx.setPrimEnv(&col, &ptcl->mEnvColor);
++#endif
+ 		GXLoadPosMtxImm(mtx1.mMtx, 0);
+ 
+ 		if (mOrientedDrawConfig.mIsDoubleSided) {

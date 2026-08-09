@@ -1,0 +1,1099 @@
+diff --git a/include/AyuStack.h b/include/AyuStack.h
+index 0241ab7..34a9663 100644
+--- a/include/AyuStack.h
++++ b/include/AyuStack.h
+@@ -18,7 +18,8 @@ class AyuCache {
+ public:
+ 	AyuCache(u32);
+ 
+-	void init(u32 bufferStart, u32 bufferEnd);
++	// PC: buffer bounds are host addresses — pointer-width on LP64.
++	void init(uintptr_t bufferStart, uintptr_t bufferEnd);
+ 	void* mallocL(u32 sizeBytes);
+ 	void cacheFree(void* ptr);
+ 	bool isEmpty();
+@@ -69,13 +70,25 @@ public:
+ 	int getMaxFree() { return (mSize - mTotalSize - 8 > 0) ? mSize - mTotalSize - 8 : 0; }
+ 	void inactivate() { mIsActive = false; }
+ 
++	int getPeak() { return mPeakSize; }
++
+ 	s32 mAllocType;         // _00, allocation mode (e.g. AYU_STACK_GROW_DOWN/UP)
+ 	int mSize;              // _04, total size in bytes
+ 	int mTotalSize;         // _08, total bytes currently allocated
+-	u32 mInitialStackTop;   // _0C, base pointer for upward growth
+-	u32 mInitialStackLimit; // _10, base pointer for downward growth
+-	u32 mStackTop;          // _14, current top when growing upward
+-	u32 mStackLimit;        // _18, current limit when growing downward
++	// PC: high-water mark of mTotalSize, maintained in push(). mTotalSize alone
++	// is a SAMPLE — whatever happened to be live at the instant you read it —
++	// and this heap family is transient by design, so the value after a stage
++	// loads can sit far below what the load itself needed. Sizing a heap from
++	// the sample is the mistake the render caps already taught (v93-v95:
++	// "report uncapped demand, never the clamped value"), and 'teki' repeated
++	// it in v96. Never reset with the rest: peaks are for the whole run.
++	int mPeakSize;
++	// PC: these four hold host addresses (deref'd via casts) — pointer-width
++	// on LP64. Runtime-only struct; the GC offset comments no longer apply.
++	uintptr_t mInitialStackTop;   // _0C, base pointer for upward growth
++	uintptr_t mInitialStackLimit; // _10, base pointer for downward growth
++	uintptr_t mStackTop;          // _14, current top when growing upward
++	uintptr_t mStackLimit;        // _18, current limit when growing downward
+ 	bool mProtectOverflow;  // _1C, whether guard word/checks are enabled
+ 	bool mIsActive;         // _1D, whether this stack is currently active
+ 	immut char* mName;      // _20
+diff --git a/include/Colour.h b/include/Colour.h
+index f9f6826..7a948ce 100644
+--- a/include/Colour.h
++++ b/include/Colour.h
+@@ -15,6 +15,13 @@
+ /**
+  * @brief TODO
+  */
++// GXColor1u32 expects the GC (big-endian) lane order r<<24|g<<16|b<<8|a. The
++// game reinterprets Colour structs as u32 for it, which only matches on GC —
++// on LE hosts alpha lands in red and alpha reads as the red byte ("Start"
++// orange rendered magenta; fades rendered opaque). PC code paths pack
++// explicitly via this macro (GC keeps the original casts for matching).
++#define PC_GX_COLOR(c) (((u32)(c).r << 24) | ((u32)(c).g << 16) | ((u32)(c).b << 8) | (u32)(c).a)
++
+ class Colour {
+ public:
+ 	Colour() { }
+diff --git a/include/Dolphin/GX/GXFifo.h b/include/Dolphin/GX/GXFifo.h
+index 50c8e30..83bf0dd 100644
+--- a/include/Dolphin/GX/GXFifo.h
++++ b/include/Dolphin/GX/GXFifo.h
+@@ -48,6 +48,32 @@ typedef struct _GXFifoObjPriv {
+ typedef void (*GXBreakPtCallback)(void);
+ 
+ // PPC Write Gather Pipe
++#if defined(TARGET_PC)
++// PC: the write-gather pipe becomes a set of assignment proxies so every
++// `GXWGFifo.x = v` in unmodified game code lands in the vertex-capture
++// layer (pc_gx_stub.cpp). Compiled as C++ everywhere, so this is exact.
++extern "C" {
++void pc_gx_fifo_u8(u8 v);
++void pc_gx_fifo_s8(s8 v);
++void pc_gx_fifo_u16(u16 v);
++void pc_gx_fifo_s16(s16 v);
++void pc_gx_fifo_u32(u32 v);
++void pc_gx_fifo_s32(s32 v);
++void pc_gx_fifo_f32(f32 v);
++}
++typedef struct PPCWGPipe {
++	// ::-qualified param types: inside the struct, bare u8/f32 etc. find the
++	// sibling members (injected names), not the global typedefs.
++	struct { void operator=(::u8 v) volatile { pc_gx_fifo_u8(v); } } u8;
++	struct { void operator=(::s8 v) volatile { pc_gx_fifo_s8(v); } } s8;
++	struct { void operator=(::u16 v) volatile { pc_gx_fifo_u16(v); } } u16;
++	struct { void operator=(::s16 v) volatile { pc_gx_fifo_s16(v); } } s16;
++	struct { void operator=(::u32 v) volatile { pc_gx_fifo_u32(v); } } u32;
++	struct { void operator=(::s32 v) volatile { pc_gx_fifo_s32(v); } } s32;
++	struct { void operator=(::f32 v) volatile { pc_gx_fifo_f32(v); } } f32;
++	struct { void operator=(::f64 v) volatile { pc_gx_fifo_f32((::f32)v); } } f64;
++} PPCWGPipe;
++#else
+ typedef union {
+ 	u8 u8;
+ 	u16 u16;
+@@ -60,6 +86,7 @@ typedef union {
+ 	f32 f32;
+ 	f64 f64;
+ } PPCWGPipe;
++#endif
+ 
+ extern volatile PPCWGPipe GXWGFifo AT_ADDRESS(GXFIFO_ADDR);
+ 
+diff --git a/include/Dolphin/OS/OSUtil.h b/include/Dolphin/OS/OSUtil.h
+index c6de5d1..acb2ed2 100644
+--- a/include/Dolphin/OS/OSUtil.h
++++ b/include/Dolphin/OS/OSUtil.h
+@@ -14,8 +14,9 @@ BEGIN_SCOPE_EXTERN_C
+ //////////////////////////////////
+ 
+ // Macros for rounding to 32-alignment.
+-#define OSRoundUp32B(x)   (((u32)(x) + 0x1F) & ~(0x1F))
+-#define OSRoundDown32B(x) (((u32)(x)) & ~(0x1F))
++// PC: pointer-width so rounding a host pointer doesn't truncate it (LP64).
++#define OSRoundUp32B(x)   (((uintptr_t)(x) + 0x1F) & ~((uintptr_t)0x1F))
++#define OSRoundDown32B(x) (((uintptr_t)(x)) & ~((uintptr_t)0x1F))
+ 
+ // Address conversions.
+ #define OSPhysicalToCached(paddr)    ((void*)((u32)(paddr) + OS_BASE_CACHED))
+diff --git a/include/Dolphin/ai.h b/include/Dolphin/ai.h
+index ef3377e..bb57f55 100644
+--- a/include/Dolphin/ai.h
++++ b/include/Dolphin/ai.h
+@@ -18,7 +18,8 @@ typedef void (*AIDCallback)(void);
+ 
+ /////////////// AI FUNCTIONS ///////////////
+ AIDCallback AIRegisterDMACallback(AIDCallback callback);
+-void AIInitDMA(u32 start_addr, u32 length);
++// PC: start_addr is a host main-memory address — pointer-width on LP64.
++void AIInitDMA(uintptr_t start_addr, u32 length);
+ BOOL AIGetDMAEnableFlag(void);
+ void AIStartDMA(void);
+ void AIStopDMA(void);
+diff --git a/include/Dolphin/ar.h b/include/Dolphin/ar.h
+index 8a541f0..d35d086 100644
+--- a/include/Dolphin/ar.h
++++ b/include/Dolphin/ar.h
+@@ -12,15 +12,20 @@ typedef struct ARQRequest ARQRequest;
+ typedef void (*ARCallback)(void);
+ 
+ // ARQ callback function type.
+-typedef void (*ARQCallback)(u32 ptrToRequest);
++// PC: the argument is a pointer to the request — pointer-width on LP64.
++typedef void (*ARQCallback)(uintptr_t ptrToRequest);
+ 
++// PC: owner is an opaque token (callers pass pointers), and source/dest
++// carry a host main-memory address on one side of every transfer — all
++// pointer-width on LP64. The pc_aram shim treats the ARAM side as an
++// offset into the emulated ARAM buffer. Runtime-only struct: safe to widen.
+ struct ARQRequest {
+ 	ARQRequest* next;     // _00
+-	u32 owner;            // _04
++	uintptr_t owner;      // _04
+ 	u32 type;             // _08
+ 	u32 priority;         // _0C
+-	u32 source;           // _10
+-	u32 dest;             // _14
++	uintptr_t source;     // _10
++	uintptr_t dest;       // _14
+ 	u32 length;           // _18
+ 	ARQCallback callback; // _1C
+ };
+@@ -33,7 +38,7 @@ void __ARQServiceQueueLo();
+ void __ARQCallbackHack();
+ void __ARQInterruptServiceRoutine();
+ void ARQInit();
+-void ARQPostRequest(ARQRequest* task, u32 owner, u32 type, u32 priority, u32 source, u32 dest, u32 length, ARQCallback callback);
++void ARQPostRequest(ARQRequest* task, uintptr_t owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest, u32 length, ARQCallback callback);
+ 
+ // AR functions.
+ ARCallback ARRegisterDMACallback(ARCallback callback);
+diff --git a/include/GoalItem.h b/include/GoalItem.h
+index e4a5b8c..36203cc 100644
+--- a/include/GoalItem.h
++++ b/include/GoalItem.h
+@@ -150,10 +150,17 @@ public:
+ 	s16 mWaypointIdx;                     // _42A
+ 	u32 mHeldPikis[3];                    // _42C, contains counts for leaf/bud/flower
+ 	ItemShapeObject* _438[3];             // _438
++	// _444.._458: three GoalLeg{Fulcrum*, RopeItem*} pairs accessed by overlay:
++	// (GoalLeg*)((&_444) + i*2) for i=0..2 (init at goalItem.cpp:627, refresh at
++	// :796). The pairs need six consecutive POINTER slots; _454/_458 were
++	// mis-typed as u32 (4 bytes on LP64), so pair i=2 spilled 8 bytes into
++	// SeContext — the onion-activation crash (GoalItem::refresh SIGSEGV).
++	// Typing them as the pointers they hold keeps GC offsets identical and
++	// makes the overlay exact on LP64.
+ 	GoalLeg* _444;                        // _444
+ 	RopeItem* mRope[3];                   // _448
+-	u32 _454;                             // _454
+-	u32 _458;                             // _458
++	Fulcrum* _454;                        // _454 (leg 2 fulcrum via overlay)
++	RopeItem* _458;                       // _458 (leg 2 rope via overlay)
+ 	SeContext _45C;                       // _45C
+ 	ShapeDynMaterials mAnimatedMaterials; // _484
+ };
+diff --git a/include/Matrix4f.h b/include/Matrix4f.h
+index 5fe7063..d0b69d4 100644
+--- a/include/Matrix4f.h
++++ b/include/Matrix4f.h
+@@ -103,7 +103,17 @@ public:
+ 		mMtx[2][3] = z;
+ 	}
+ 
+-	static immut Matrix4f ident;
++	// PC: NOT immut. It is written at runtime — graphics.cpp:845 does
++	// `const_cast<Matrix4f&>(Matrix4f::ident).makeIdentity()`, with the
++	// decomp's own comment "Well I suppose this has to initialize
++	// *somewhere*". Note that `immut` expands to nothing in the MATCHING
++	// build, so retail's object was never const either; the const-ness is an
++	// artifact of the non-matching build, and with it clang is entitled to
++	// place the object in __TEXT.__const. At -O0 it lands in writable __DATA
++	// and the write works. At -O2 it lands in read-only memory and the write
++	// is a SIGBUS in System::Initialise, before a single line of output —
++	// which is exactly what it did.
++	static Matrix4f ident;
+ 
+ 	Mtx44 mMtx; // _00-_40
+ };
+diff --git a/include/Parameters.h b/include/Parameters.h
+index 083439f..108e405 100644
+--- a/include/Parameters.h
++++ b/include/Parameters.h
+@@ -31,7 +31,13 @@ public:
+ 	 * @brief Converts a string to a fourcc ID and sets it as the ID.
+ 	 * @param id String ID to convert and store.
+ 	 */
+-	void Set(immut char* id) { mID = *(s32*)id; }
++	// PC: compose big-endian (byte overlay reverses on LE hosts; parameter
++	// files store IDs as big-endian words).
++	void Set(immut char* id)
++	{
++		immut u8* p = (immut u8*)id;
++		mID = (s32)(((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3]);
++	}
+ 
+ 	/**
+ 	 * @brief Gets the fourcc ID.
+diff --git a/include/Route.h b/include/Route.h
+index e983ce6..b88231e 100644
+--- a/include/Route.h
++++ b/include/Route.h
+@@ -97,10 +97,13 @@ public:
+ 	{
+ 		mIntID = id;
+ 
+-		char* str = reinterpret_cast<char*>(&mIntID);
+-		for (int i = 0; i < 4; i++) {
+-			mStringID[i] = str[i];
+-		}
++		/* PC: decompose big-endian so mStringID reads left-to-right as the
++		   4CC (the GC's `((char*)&mIntID)[i]` overlay put the MSB first only
++		   because it was big-endian). */
++		mStringID[0] = (char)((mIntID >> 24) & 0xFF);
++		mStringID[1] = (char)((mIntID >> 16) & 0xFF);
++		mStringID[2] = (char)((mIntID >> 8) & 0xFF);
++		mStringID[3] = (char)(mIntID & 0xFF);
+ 
+ 		mStringID[4] = '\0';
+ 	}
+@@ -110,10 +113,11 @@ public:
+ 	 */
+ 	inline void updateID()
+ 	{
+-		char* str = reinterpret_cast<char*>(&mIntID);
+-		for (int i = 0; i < 4; i++) {
+-			str[i] = mStringID[i];
+-		}
++		/* PC: compose big-endian so the numeric ID equals the multi-char
++		   literal ('test' etc.) on any host endian — the raw byte overlay
++		   byte-swapped route IDs on little-endian, so id2idx('test') never
++		   matched and every waypoint lookup returned null. */
++		mIntID = ((u32)(u8)mStringID[0] << 24) | ((u32)(u8)mStringID[1] << 16) | ((u32)(u8)mStringID[2] << 8) | (u32)(u8)mStringID[3];
+ 	}
+ 
+ 	// unused/inlined:
+diff --git a/include/jaudio/audiostruct.h b/include/jaudio/audiostruct.h
+index 74329b5..4286ca4 100644
+--- a/include/jaudio/audiostruct.h
++++ b/include/jaudio/audiostruct.h
+@@ -113,6 +113,30 @@ struct jcs_ {
+ };
+ 
+ // needed to match UpdateEffecterParam
++#if defined(TARGET_PC)
++// PC: `parts` overlays `whole`, so its member order is endianness-dependent —
++// on the GameCube `upper` is the HIGH byte of the u16 and the nibbles are
++// allocated from the MSB down. Read natively on a little-endian host, `upper`
++// picks up the LOW byte instead. That fed DSP_SetBusConnect an out-of-range
++// index, which ran off the end of connect_table[12] and gave voices bus ids
++// like 0x5DD0 instead of 0x0D00/0x0D60 — so every send missed the main buses
++// and the mix stayed silent.
++//
++// Mirrored so the bit positions within `whole` match hardware: lower1 = bits
++// 3..0, lower0 = bits 7..4, upper = bits 15..8.
++//
++// Fourth instance of this family, after the .bx overlays, the sequencer's
++// 32-bit registers and SOUNDID_. Any union viewing one value through
++// differently-sized members needs this treatment.
++typedef union MixConfig {
++	u16 whole;
++	struct {
++		u8 lower1 : 4;
++		u8 lower0 : 4;
++		u8 upper;
++	} parts;
++} MixConfig;
++#else
+ typedef union MixConfig {
+ 	u16 whole;
+ 	struct {
+@@ -121,6 +145,7 @@ typedef union MixConfig {
+ 		u8 lower1 : 4;
+ 	} parts;
+ } MixConfig;
++#endif
+ 
+ typedef BOOL (*JCUpdateCallback)(jc_*, JCSTATUS);
+ 
+diff --git a/include/jaudio/audiothread.h b/include/jaudio/audiothread.h
+index ac4c52e..fddb5f2 100644
+--- a/include/jaudio/audiothread.h
++++ b/include/jaudio/audiothread.h
+@@ -24,6 +24,9 @@ BEGIN_SCOPE_EXTERN_C
+ 
+ //////////// JAUDIO AUDIO THREAD FUNCTIONS ////////////
+ void DspSyncCountClear(int count);
++#if defined(TARGET_PC)
++extern volatile u32 g_pc_jac_audio_ready;
++#endif
+ int DspSyncCountCheck();
+ void StopAudioThread();
+ void StartAudioThread(void* heap, s32 heapSize, u32 aramSize, u32 flags);
+diff --git a/include/jaudio/bankdrv.h b/include/jaudio/bankdrv.h
+index d618ee7..83822cf 100644
+--- a/include/jaudio/bankdrv.h
++++ b/include/jaudio/bankdrv.h
+@@ -17,7 +17,7 @@ Inst_* Bank_InstChange(Bank_*, u32);
+ Voice_* Bank_VoiceChange(Bank_*, u32);
+ Perc_* Bank_PercChange(Bank_*, u32);
+ int Bank_GetInstKeymap(Inst_*, u8);
+-int Bank_GetInstVmap(Inst_*, u8, u8);
++intptr_t Bank_GetInstVmap(Inst_*, u8, u8);
+ Vmap_* Bank_GetPercVmap(Perc_*, u8, u8);
+ int Bank_GetVoiceMap(Voice_*, u16);
+ f32 Bank_SenseToOfs(Sense_*, u8);
+diff --git a/include/jaudio/bx.h b/include/jaudio/bx.h
+index ac0279a..9d49d1d 100644
+--- a/include/jaudio/bx.h
++++ b/include/jaudio/bx.h
+@@ -6,6 +6,36 @@
+ #include "jaudio/heapctrl.h"
+ #include "types.h"
+ 
++// PC: these structs are overlaid directly on the big-endian .bx file bytes, so
++// on an LP64 little-endian host their scalars and pointer slots need typed
++// accessors to keep the file layout byte-exact. bx_pc.h explains the scheme;
++// the JAU_* macros below are plain field types on the GC target.
++#include "jaudio/bx_pc.h"
++
++#if defined(TARGET_PC)
++#define JAU_PTR(T)  JauFilePtr<T>
++#define JAU_U32     JauBE32<u32>
++#define JAU_S32     JauBE32<s32>
++#define JAU_INT     JauBE32<int>
++#define JAU_F32     JauBE32<f32>
++#define JAU_S16     JauBE16<s16>
++#define JAU_U16     JauBE16<u16>
++#define JAU_HEAPMEM JauFileHeap
++#define JAU_VEC     JauVecPtr
++#else
++#define JAU_PTR(T)  T*
++#define JAU_U32     u32
++#define JAU_S32     s32
++#define JAU_INT     int
++#define JAU_F32     f32
++#define JAU_S16     s16
++#define JAU_U16     u16
++#define JAU_HEAPMEM    jaheap_
++#define JAU_VEC        s16*
++#define JAU_HEAP(x)    (x)
++#define JAU_PTR_RAW(x) ((uintptr_t)(x))
++#endif
++
+ #define BANK_INST_COUNT        (0xF0)
+ #define BANK_TEST_INST_COUNT   (0x80)
+ #define BANK_TEST_VOICE_OFFSET (BANK_TEST_INST_COUNT)
+@@ -43,24 +73,24 @@ typedef struct WaveID_ WaveID_;
+ ////////////////////// BANK STRUCTS //////////////////////
+ 
+ struct Bank_ {
+-	int mMagic; // _00 | 'BANK'
+-	union {     // _04 | Can point to INST, VOICE, PERC.
++	JAU_INT mMagic; // _00 | 'BANK'
++	union {         // _04 | Can point to INST, VOICE, PERC.
+ 		// There's no way this was actually an anonymous union, as this only became a feature
+ 		// of the C programming language in C11. However, it does make the code nicer to read.
+-		Inst_* mInstruments[BANK_INST_COUNT];
+-		Voice_* mVoices[BANK_INST_COUNT];
+-		Perc_* mPercs[BANK_INST_COUNT];
++		JAU_PTR(Inst_) mInstruments[BANK_INST_COUNT];
++		JAU_PTR(Voice_) mVoices[BANK_INST_COUNT];
++		JAU_PTR(Perc_) mPercs[BANK_INST_COUNT];
+ 	};
+ };
+ 
+ struct Ibnk_ {
+-	int magic;                            // _00 | 'IBNK'
+-	u32 _04;                              // _04
+-	u32 _08;                              // _08
+-	int _0C;                              // _0C
+-	struct WaveArchiveBank_* waveArcBank; // _10
+-	u8 _14[0x20 - 0x14];                  // _14
+-	Bank_ bank;                           // _20
++	JAU_INT magic;                     // _00 | 'IBNK'
++	JAU_U32 _04;                       // _04
++	JAU_U32 _08;                       // _08
++	JAU_INT _0C;                       // _0C
++	JAU_PTR(WaveArchiveBank_) waveArcBank; // _10
++	u8 _14[0x20 - 0x14];               // _14
++	Bank_ bank;                        // _20
+ };
+ 
+ /**
+@@ -70,10 +100,16 @@ struct Ibnk_ {
+  */
+ struct Vmap_ {
+ 	u8 mBaseVelocity; // _00
+-	s16 mWsysID;      // _04
+-	s16 mWaveID;      // _06
+-	f32 mVolume;      // _08
+-	f32 mPitch;       // _0C
++	// AUDIT RESOLVED: the field comments (_04/_06) are correct, not natural
++	// alignment (_02/_04). Confirmed against real velocity-map data — the bytes
++	// at offset 4 read as the big-endian pair (wsysID=7, waveID=6) for the title
++	// BGM, and oneshot.c's testPercMap reads exactly that pair as one 32-bit
++	// field at _04, which only lines up with this layout.
++	u8 mPad[3];       // _01
++	JAU_S16 mWsysID;  // _04
++	JAU_S16 mWaveID;  // _06
++	JAU_F32 mVolume;  // _08
++	JAU_F32 mPitch;   // _0C
+ };
+ 
+ /**
+@@ -82,9 +118,9 @@ struct Vmap_ {
+  * @note Size: 0x10.
+  */
+ struct InstKeymap_ {
+-	u8 mBaseKey;           // _00
+-	u32 mVelocityCount;    // _04
+-	Vmap_* mVelocities[2]; // _08
++	u8 mBaseKey;              // _00
++	JAU_U32 mVelocityCount;   // _04
++	JAU_PTR(Vmap_) mVelocities[2]; // _08
+ };
+ 
+ /**
+@@ -93,33 +129,35 @@ struct InstKeymap_ {
+  * @note Size: 0x18.
+  */
+ struct PercKeymap_ {
+-	f32 mPitch;            // _00
+-	f32 mVolume;           // _04
+-	void* _08;             // _08, pointer type unknown, but gets hit by PTconvert in Bank_Test
+-	void* _0C;             // _0C, pointer type unknown, but gets hit by PTconvert in Bank_Test
+-	int mVelocityCount;    // _10
+-	Vmap_* mVelocities[2]; // _14
++	JAU_F32 mPitch;           // _00
++	JAU_F32 mVolume;          // _04
++	JAU_PTR(u8) _08;          // _08, pointer type unknown, but gets hit by PTconvert in Bank_Test
++	JAU_PTR(u8) _0C;          // _0C, pointer type unknown, but gets hit by PTconvert in Bank_Test
++	JAU_INT mVelocityCount;   // _10
++	JAU_PTR(Vmap_) mVelocities[2]; // _14
+ };
+ 
+ struct Sense_ {
+ 	u8 id;        // _00
+ 	u8 type;      // _01
+ 	u8 threshold; // _02
+-	f32 min;      // _04
+-	f32 max;      // _08
++	JAU_F32 min;  // _04
++	JAU_F32 max;  // _08
+ };
+ 
+ struct Osc_ {
+-	u8 mode;               // _00
+-	f32 rate;              // _04
+-	s16* attackVecOffset;  // _08
+-	s16* releaseVecOffset; // _0C
+-	f32 width;             // _10
+-	f32 vertex;            // _14
++	u8 mode;                       // _00
++	JAU_F32 rate;                  // _04
++	JAU_VEC attackVecOffset;       // _08
++	JAU_VEC releaseVecOffset;      // _0C
++	JAU_F32 width;                 // _10
++	JAU_F32 vertex;                // _14
+ };
+ 
+ /**
+  * @note Size: 0x18.
++ * @note PC: runtime-only (per-voice oscillator state), never overlaid on file
++ *       bytes — stays host-native.
+  */
+ struct Oscbuf_ {
+ 	u8 state;         // _00
+@@ -136,41 +174,43 @@ struct Oscbuf_ {
+  * @note Size: 0x40.
+  */
+ struct Inst_ {
+-	int mMagic;                  // _00 | 'INST'
+-	u32 mFlag;                   // _04
+-	f32 mFreqMultiplier;         // _08
+-	f32 mGainMultiplier;         // _0C
+-	Osc_* mOscillators[2];       // _10
+-	Rand_* mEffects[2];          // _18
+-	Sense_* mSensors[2];         // _20
+-	int mKeyRegionCount;         // _28
+-	InstKeymap_* mKeyRegions[5]; // _2C
++	JAU_INT mMagic;                       // _00 | 'INST'
++	JAU_U32 mFlag;                        // _04
++	JAU_F32 mFreqMultiplier;              // _08
++	JAU_F32 mGainMultiplier;              // _0C
++	JAU_PTR(Osc_) mOscillators[2];        // _10
++	JAU_PTR(Rand_) mEffects[2];           // _18
++	JAU_PTR(Sense_) mSensors[2];          // _20
++	JAU_INT mKeyRegionCount;              // _28
++	JAU_PTR(InstKeymap_) mKeyRegions[5];  // _2C
+ };
+ 
+ struct Voice_ {
+-	u8 _00[0x8];  // _00, unknown
+-	int size;     // _08, count of whatever's at 0xC
+-	void* _0C[1]; // _0C, unsure of length of array or type
++	u8 _00[0x8];          // _00, unknown
++	JAU_INT size;         // _08, count of whatever's at 0xC
++	JAU_PTR(u8) _0C[1];   // _0C, unsure of length of array or type
+ };
+ 
+ struct Perc_ {
+-	int mMagic;                    // _00 | 'PER2' (or 'PERC'?)
+-	u8 _04[0x84];                  // _04, unknown
+-	PercKeymap_* mKeyRegions[128]; // _88
+-	s8 panTable[128];              // _288
+-	u16 releaseTable[128];         // _308
++	JAU_INT mMagic;                        // _00 | 'PER2' (or 'PERC'?)
++	u8 _04[0x84];                          // _04, unknown
++	JAU_PTR(PercKeymap_) mKeyRegions[128]; // _88
++	s8 panTable[128];                      // _288
++	JAU_U16 releaseTable[128];             // _308
+ };
+ 
+ struct Rand_ {
+ 	u8 id;               // _00
+-	f32 value;           // _04
+-	f32 range;           // _08
++	JAU_F32 value;       // _04
++	JAU_F32 range;       // _08
+ 	u8 _0C[0x10 - 0x0C]; // _0C
+ };
+ 
++// Overlaid on PercKeymap_'s _08/_0C pair by EffecterInit_Perc, so it is file
++// data too and must keep the file's 4-byte pointer slot.
+ struct Pmap_ {
+-	Rand_* randomEffect; // _00
+-	int _04;             // _04
++	JAU_PTR(Rand_) randomEffect; // _00
++	JAU_INT _04;                 // _04
+ };
+ 
+ //////////////////////////////////////////////////////////
+@@ -178,77 +218,85 @@ struct Pmap_ {
+ 
+ // Name fabricated, but makes sense in line with Ibnk_
+ struct Wsys_ {
+-	int magic;                     // _00, 'WSYS'
+-	int size;                      // _04
+-	int globalID;                  // _08
+-	int _0C;                       // _0C, unused?
+-	WaveArchiveBank_* waveArcBank; // _10
+-	CtrlGroup_* ctrlGroup;         // _14
++	JAU_INT magic;                         // _00, 'WSYS'
++	JAU_INT size;                          // _04
++	JAU_INT globalID;                      // _08
++	JAU_INT _0C;                           // _0C, unused?
++	JAU_PTR(WaveArchiveBank_) waveArcBank; // _10
++	JAU_PTR(CtrlGroup_) ctrlGroup;         // _14
+ };
+ 
+ struct WaveArchiveBank_ {
+-	int magic;                   // _00, 'WINF'
+-	int count;                   // _04, same count as CtrlGroup_
+-	WaveArchive_* waveGroups[1]; // _08, array size variable
++	JAU_INT magic;                      // _00, 'WINF'
++	JAU_INT count;                      // _04, same count as CtrlGroup_
++	JAU_PTR(WaveArchive_) waveGroups[1]; // _08, array size variable
+ };
+ 
+ struct CtrlGroup_ {
+-	int magic;        // _00, 'WBCT'
+-	u32 _04;          // _04, unknown
+-	int count;        // _08, same count as WaveArchiveBank_
+-	SCNE_* scenes[1]; // _0C, array size variable
++	JAU_INT magic;              // _00, 'WBCT'
++	JAU_U32 _04;                // _04, unknown
++	JAU_INT count;              // _08, same count as WaveArchiveBank_
++	JAU_PTR(SCNE_) scenes[1];   // _0C, array size variable
+ };
+ 
+ // Name fabricated based on magic ID.
+ struct SCNE_ {
+-	int magic;            // _00, 'SCNE'
+-	u32 externalMode;     // _04
+-	u32 dependencyCount;  // _08
+-	Ctrl_* cdf;           // _0C
+-	Ctrl_* cex;           // _10
+-	Ctrl_* cst;           // _14
+-	int dependencyIds[1]; // _18, variable size?
++	JAU_INT magic;              // _00, 'SCNE'
++	JAU_U32 externalMode;       // _04
++	JAU_U32 dependencyCount;    // _08
++	JAU_PTR(Ctrl_) cdf;         // _0C
++	JAU_PTR(Ctrl_) cex;         // _10
++	JAU_PTR(Ctrl_) cst;         // _14
++	JAU_INT dependencyIds[1];   // _18, variable size?
+ };
+ 
+ struct Ctrl_ {
+-	int magic;           // _00, 'C-DF', 'C-EX' or 'C-ST'
+-	int count;           // _04
+-	WaveID_* waveIDs[1]; // _08, array size variable
++	JAU_INT magic;                // _00, 'C-DF', 'C-EX' or 'C-ST'
++	JAU_INT count;                // _04
++	JAU_PTR(WaveID_) waveIDs[1];  // _08, array size variable
+ };
+ 
+ // Name fabricated from Xayr's tools.
+ struct WaveID_ {
+-	u32 id;         // _00, split into sound id and ws id
+-	jaheap_ heap;   // _04
+-	u32 loadStatus; // _30
+-	Wave_* data;    // _34
++	JAU_U32 id;             // _00, split into sound id and ws id
++	JAU_HEAPMEM heap;       // _04 | PC: 0x2C placeholder, real heap via JAU_HEAP()
++	u32 loadStatus;         // _30 | runtime DVD status — host-native
++	JAU_PTR(Wave_) data;    // _34
+ };
+ 
+ struct WaveArchive_ {
+-	char filePath[0x40]; // _00, might be smaller, unsure
+-	jaheap_ heap;        // _40
+-	u32 fileLoadStatus;  // _6C
+-	int waveCount;       // _70
+-	Wave_* waves[1];     // _74, array size variable
++	char filePath[0x40];    // _00, might be smaller, unsure
++	JAU_HEAPMEM heap;       // _40 | PC: 0x2C placeholder, real heap via JAU_HEAP()
++	u32 fileLoadStatus;     // _6C | runtime DVD status — host-native
++	JAU_INT waveCount;      // _70
++	JAU_PTR(Wave_) waves[1]; // _74, array size variable
+ };
+ 
+ /**
+  * @brief File data, size unknown
+  */
+ struct Wave_ {
+-	u8 _00;                // _00
+-	u8 compBlockIdx;       // _01
+-	u8 key;                // _02
+-	f32 sampleRate;        // _04
+-	int srcAddress;        // _08
+-	int length;            // _0C
+-	s32 isLooping;         // _10
+-	s32 loopAddress;       // _14
+-	s32 loopStartPosition; // _18
+-	s32 _1C;               // _1C
+-	s16 loopYN1;           // _20
+-	s16 loopYN2;           // _22
+-	u32* fileLoadStatus;   // _24, set to dolphin/dvd.h 'DVD_RESULT_*' defines
++	u8 _00;                        // _00
++	u8 compBlockIdx;               // _01
++	u8 key;                        // _02
++	JAU_F32 sampleRate;            // _04
++	JAU_INT srcAddress;            // _08
++	JAU_INT length;                // _0C
++	// The tail of this record is the published wsys wave layout:
++	//   _10 loop (bool)   _14 loopStart   _18 loopEnd   _1C sampleCount
++	// all three of the latter being SAMPLE INDICES. The decomp's names for _14
++	// and _18 are wrong in a way that bites: `loopAddress` is not an address,
++	// and `loopStartPosition` is the loop END, not a start. Believing the names
++	// collapses every loop to a few samples at the tail (because _18 always sits
++	// just under _1C) — a ~490 Hz drone that never terminates. See the
++	// loop-point note in pc_dsp.cpp's pc_voice_fetch.
++	JAU_S32 isLooping;             // _10
++	JAU_S32 loopAddress;           // _14 | loop START sample
++	JAU_S32 loopStartPosition;     // _18 | loop END sample
++	JAU_S32 _1C;                   // _1C | total sample count
++	JAU_S16 loopYN1;               // _20
++	JAU_S16 loopYN2;               // _22
++	JAU_PTR(u32) fileLoadStatus;   // _24, set to dolphin/dvd.h 'DVD_RESULT_*' defines
+ };
+ 
+ #endif
+diff --git a/include/jaudio/cmdqueue.h b/include/jaudio/cmdqueue.h
+index e3c1011..73a60ba 100644
+--- a/include/jaudio/cmdqueue.h
++++ b/include/jaudio/cmdqueue.h
+@@ -10,6 +10,31 @@ BEGIN_SCOPE_EXTERN_C
+ 
+ typedef struct cmdqueue_ CmdQueue;
+ 
++#if defined(TARGET_PC)
++// PC: Jal_AddCmdQueue builds a SIXTEEN-entry message queue starting at
++// `message`. On the GameCube OSMessage is 4 bytes, so those 16 entries occupy
++// 0x40 bytes and fit exactly in `message` + `_24`, ending right where `track`
++// begins at _60. On LP64 OSMessage is a pointer — 8 bytes — so the same 16
++// entries need 0x80 bytes and the queue writes straight THROUGH track, _64 and
++// next.
++//
++// That corrupted the command queue's own list: `track` became a small garbage
++// value, so Jal_FrameWork's port check faulted at ~0x3c7 (a null-ish seqp_
++// plus trackPort offset), and menu/area SFX played through a scribbled queue —
++// the "saw-like buzzing" and "long static" in the save and area-select
++// screens.
++//
++// This struct is neither file data nor shared with the DSP, so it is free to
++// take its natural host layout: give the buffer its real 16 elements and let
++// the fields after it sit wherever the ABI puts them.
++struct cmdqueue_ {
++	Jac_MessageQueue msgQueue;
++	OSMessage message[16];
++	seqp_* track;
++	u8 _64;
++	CmdQueue* next;
++};
++#else
+ struct cmdqueue_ {
+ 	Jac_MessageQueue msgQueue; // _00
+ 	OSMessage message;         // _20
+@@ -18,6 +43,7 @@ struct cmdqueue_ {
+ 	u8 _64;                    // _64
+ 	CmdQueue* next;            // _68;
+ };
++#endif
+ 
+ extern CmdQueue* queue_list; // Pointer to the start of a linked list
+ 
+diff --git a/include/jaudio/dspdriver.h b/include/jaudio/dspdriver.h
+index b7aaa39..3ff4a00 100644
+--- a/include/jaudio/dspdriver.h
++++ b/include/jaudio/dspdriver.h
+@@ -9,8 +9,8 @@
+ 
+ dspch_* GetDSPchannelHandle(u32 idx);
+ void InitDSPchannel();
+-dspch_* AllocDSPchannel(u32, u32);
+-int DeAllocDSPchannel(dspch_*, u32);
++dspch_* AllocDSPchannel(u32, uintptr_t);
++int DeAllocDSPchannel(dspch_*, uintptr_t);
+ dspch_* GetLowerDSPchannel();
+ dspch_* GetLowerActiveDSPchannel();
+ BOOL ForceStopDSPchannel(dspch_*);
+diff --git a/include/jaudio/dspinterface.h b/include/jaudio/dspinterface.h
+index 1b1248a..3959f44 100644
+--- a/include/jaudio/dspinterface.h
++++ b/include/jaudio/dspinterface.h
+@@ -103,10 +103,17 @@ struct DSPchannel_ {
+ 	s16 filterMode;                 // _108 - DSP_SetFilterMode
+ 	DSPBOOL endRequested;           // _10A - DSP_AllocInit, DSP_SetMixerVolume
+ 	u32 ageCounter;                 // _10C - DSP_PlayStart
+-	u32 loopAddress;                // _110 - DSP_SetWaveInfo
+-	u32 loopStartPosition;          // _114 - DSP_SetWaveInfo
++	// NAMES ARE MISLEADING — these are copied verbatim from Wave_ (_14/_18/_1C),
++	// where they are loopStart / loopEnd / sampleCount, all SAMPLE INDICES.
++	// `loopAddress` is not an address and `loopStartPosition` is not a start.
++	// Reading _114 as the loop start collapses every loop to the handful of
++	// samples at the tail, because _114 always sits just under sampleCount —
++	// that was the honking (see the loop-point note in pc_dsp.cpp's
++	// pc_voice_fetch).
++	u32 loopAddress;                // _110 - DSP_SetWaveInfo | loop START sample
++	u32 loopStartPosition;          // _114 - DSP_SetWaveInfo | loop END sample
+ 	u32 baseAddress;                // _118 - DSP_SetOscInfo, DSP_SetWaveInfo
+-	u32 _11C;                       // _11C - DSP_SetWaveInfo
++	u32 _11C;                       // _11C - DSP_SetWaveInfo | total sample count
+ 	s16 variableFirCoeffs[20];      // _120 - DSP_InitFilter, DSP_SetFIR8FilterParam
+ 	s16 biquadFilterCoeffs[4];      // _148 - DSP_InitFilter, DSP_SetIIRFilterParam
+ 	s16 lowPassCoeff;               // _150 - DSP_InitFilter, DSP_SetDistFilter
+diff --git a/include/jaudio/dspproc.h b/include/jaudio/dspproc.h
+index 9941cf0..0ab2769 100644
+--- a/include/jaudio/dspproc.h
++++ b/include/jaudio/dspproc.h
+@@ -8,9 +8,12 @@
+ s32 DSPSendCommands(u32* commands, u32 count);
+ u32 DSPReleaseHalt();
+ void DSPWaitFinish();
+-void DsetupTable(u32 cmd1, u32 cmd2, u32 cmd3, u32 cmd4, u32 cmd5);
++// PC: the table/buffer arguments are host main-memory addresses —
++// pointer-width on LP64. The PC DSP shim (M5) captures them directly; the
++// GC mailbox packing inside dspproc.c is replaced wholesale there.
++void DsetupTable(u32 cmd1, uintptr_t cmd2, uintptr_t cmd3, uintptr_t cmd4, uintptr_t cmd5);
+ void DsetMixerLevel(f32 level);
+-void DsyncFrame(u32 subframes, u32 dspbufStart, u32 dspbufEnd);
++void DsyncFrame(u32 subframes, uintptr_t dspbufStart, uintptr_t dspbufEnd);
+ void DwaitFrame();
+ void DiplSec(u32 cmd);
+ void DagbSec(u32 cmd);
+diff --git a/include/jaudio/dvdthread.h b/include/jaudio/dvdthread.h
+index 462a425..6360b05 100644
+--- a/include/jaudio/dvdthread.h
++++ b/include/jaudio/dvdthread.h
+@@ -8,7 +8,12 @@
+ 
+ /////////// JAUDIO DVD THREAD DEFINITIONS ///////////
+ // Callback function types.
+-typedef void (*Jac_DVDCallback)(u32);
++// PC: the `owner` value handed to a DVD callback is an OVERLOADED slot — an
++// id for the scene loaders (0x20000, bgm | 0x10000) but a POINTER to the
++// caller's request record for the sequence loader (file_seq.c's as[] entry,
++// which Jaf_LoadFinish then dereferences). Declared u32 it truncated that
++// pointer on LP64. uintptr_t is identical on the 32-bit target.
++typedef void (*Jac_DVDCallback)(uintptr_t);
+ typedef s32 (*TaskCallback)(void*);
+ typedef void (*ErrorCallback)(immut char*, u8* addr);
+ 
+@@ -19,9 +24,9 @@ typedef void (*ErrorCallback)(immut char*, u8* addr);
+  * @note Size: 0x58.
+  */
+ typedef struct DVDCall_ {
+-	u32 owner;                // _00
++	uintptr_t owner;          // _00 | PC: widened — see Jac_DVDCallback
+ 	char fileName[64];        // _04
+-	u32 dst;                  // _44
++	uintptr_t dst;            // _44 - PC: DRAM loads carry a host pointer here (ARAM loads a u32 offset)
+ 	u32 src;                  // _48
+ 	u32 length;               // _4C
+ 	u32* callbackStatus;      // _50
+@@ -32,17 +37,27 @@ typedef struct DVDCall_ {
+ void DVDT_SetRootPath(immut char* path);
+ void DVDT_ExtendPath(char* dst, immut char* ext);
+ s32 DVDT_AddTask(TaskCallback callback, void* stack, size_t len);
++
++#if defined(TARGET_PC)
++// ARAM race barrier: wait (bounded) for queued DVD->ARAM loads to complete.
++// Call before freeing or compacting ARAM — in-flight loads hold their
++// destinations by value. No-op when called from the DVD thread itself.
++void pc_dvdt_drain(void);
++u32 pc_dvdt_pending(void);
++void pc_dvdt_note_aram_load(int delta);
++#endif
+ void jac_dvdproc_init();
+ void* jac_dvdproc(void*);
+ s32 DVDT_LoadtoDRAM_Main(void*);
+-s32 DVDT_LoadtoDRAM(u32 owner, immut char* name, u32 dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback);
++// PC: dst is a host main-memory destination — pointer-width on LP64.
++s32 DVDT_LoadtoDRAM(uintptr_t owner, immut char* name, uintptr_t dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback);
+ void DVDT_SetBuffer(u8*, u32, u32);
+ s32 DVDT_CloseBuffer(u8*);
+ s32 DVDT_LoadtoARAM_Main(void*);
+-s32 DVDT_LoadtoARAM(u32 owner, immut char* name, u32 dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback);
++s32 DVDT_LoadtoARAM(uintptr_t owner, immut char* name, u32 dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback);
+ s32 DVDT_CheckFile(immut char* file);
+ s32 DVDT_LoadFile(immut char* file, u8* p2);
+-void DVDT_CheckPass(u32 owner, u32* status, Jac_DVDCallback callback);
++void DVDT_CheckPass(uintptr_t owner, u32* status, Jac_DVDCallback callback);
+ s32 Jac_RegisterExtFastOpen(immut char* ext);
+ s32 Jac_RegisterFastOpen(immut char* file);
+ BOOL Jac_DVDOpen(immut char* name, DVDFileInfo* info);
+diff --git a/include/jaudio/hvqm_play.h b/include/jaudio/hvqm_play.h
+index 4921f3a..baf331e 100644
+--- a/include/jaudio/hvqm_play.h
++++ b/include/jaudio/hvqm_play.h
+@@ -14,6 +14,6 @@ int Jac_GetPicture(void*, int*, int*); // TODO: types unsure (return can be -1 t
+ 
+ END_SCOPE_EXTERN_C
+ 
+-static void __LoadFin(u32);
++static void __LoadFin(uintptr_t);
+ 
+ #endif
+diff --git a/include/jaudio/oneshot.h b/include/jaudio/oneshot.h
+index 3a9ca5e..74e11f5 100644
+--- a/include/jaudio/oneshot.h
++++ b/include/jaudio/oneshot.h
+@@ -26,10 +26,33 @@ typedef union SOUNDID_ SOUNDID_;
+  *
+  * @note Size: 4. Why wasn't this just an enum... This compiler is not smart enough to optimize this.
+  */
++#if defined(TARGET_PC)
++// PC: SOUNDID_ packs [bank][program][key][velocity] from MSB to LSB (see
++// NoteON in noteon.c: `b << 16 | flag1 << 8 | flag2`), and every reader gets
++// at them through bytes[0..3]. That indexing is big-endian by construction, so
++// on a little-endian host the union hands back the bytes reversed — InstRead
++// was being called with (velocity, key) instead of (bank, program), which is
++// why no note ever found an instrument and the game stayed silent.
++//
++// Same bug class as the .bx overlays and the sequencer's 32-bit registers: a
++// multi-byte value viewed through a differently-sized member of a union.
++// Index explicitly so all existing call sites keep working unchanged.
++struct SoundIdBytes_ {
++	u8 raw[4];
++	u8& operator[](int i) { return raw[3 - i]; }
++	const u8& operator[](int i) const { return raw[3 - i]; }
++};
++
++union SOUNDID_ {
++	u32 value; // _00
++	SoundIdBytes_ bytes;
++};
++#else
+ union SOUNDID_ {
+ 	u32 value; // _00
+ 	u8 bytes[4];
+ };
++#endif
+ 
+ void Effecter_Overwrite_1ShotD(jc_*, Osc_*, u32);
+ Perc_* PercRead(u32, u32);
+diff --git a/include/jaudio/syncstream.h b/include/jaudio/syncstream.h
+index 74ba304..b9d27c9 100644
+--- a/include/jaudio/syncstream.h
++++ b/include/jaudio/syncstream.h
+@@ -42,7 +42,17 @@ struct BufControl_ {
+ 	u8 activeBufIdx;  // _03
+ 	u32 usedSize;     // _04
+ 	u32 pos;          // _08
+-	u32 mLength;      // _0C
++	// PC: OVERLOADED SLOT. For ctrl->buffCtrl[i] this holds the ADDRESS of the
++	// stream's data buffer (&ctrl->data[i]) and is dereferenced as
++	// (u8*)buff->mLength / passed to DVDReadAsyncPrio2 as the read
++	// destination; for buffCtrlMain/buffCtrlMain2 it really is a byte count.
++	// The decomp flags the ambiguity at syncstream.c:359 ("should be a
++	// pointer?") — it should. Declared u32 it chopped the host pointer on
++	// LP64, and LoadADPCM's `data[0] = 0xff` wrote through the truncated
++	// address (observed faulting at 0x401f40 for a buffer at 0x100401f40)
++	// while starting the intro movie's audio. uintptr_t is identical on the
++	// 32-bit target and holds both uses.
++	uintptr_t mLength; // _0C
+ };
+ 
+ enum AudioFormat {
+diff --git a/include/jaudio/virload.h b/include/jaudio/virload.h
+index 3af184c..4e633f3 100644
+--- a/include/jaudio/virload.h
++++ b/include/jaudio/virload.h
+@@ -14,7 +14,7 @@ void JV_GetHandle(u32);
+ BarcEntry* JV_GetRealHandle(u32 handle); // Return type unsure
+ u32 JV_CheckSize(u32);
+ u32 JV_LoadFile(u32, u8*, u32, u32);
+-u32 JV_LoadFile_Async2(u32, u8*, u32, u32, void (*)(u32), u32);
++u32 JV_LoadFile_Async2(u32, u8*, u32, u32, void (*)(uintptr_t), uintptr_t);
+ void JV_GetMemoryFile(u32);
+ 
+ #endif
+diff --git a/include/sysNew.h b/include/sysNew.h
+index 5bc5d23..0311bbe 100644
+--- a/include/sysNew.h
++++ b/include/sysNew.h
+@@ -4,13 +4,27 @@
+ #include "system.h"
+ #include "types.h"
+ #include <stddef.h>
++#if defined(TARGET_PC)
++#include <stdlib.h>
++#endif
+ 
++// PC: these globals are weak-coalesced process-wide — system frameworks'
++// static initializers call them BEFORE the game heap (gsys) exists, and
++// again for allocations the game never sees. Fall back to malloc when no
++// heap is up. (operator delete is a no-op, as on GC — those blocks leak,
++// which matches the game's own never-free discipline.)
+ inline void* operator new(size_t size)
+ {
++#if defined(TARGET_PC)
++	if (!gsys) return malloc(size);
++#endif
+ 	return System::alloc(size);
+ }
+ inline void* operator new[](size_t size)
+ {
++#if defined(TARGET_PC)
++	if (!gsys) return malloc(size);
++#endif
+ 	return System::alloc(size);
+ }
+ void* operator new(size_t size, int alignment);
+diff --git a/include/system.h b/include/system.h
+index 8fa07d2..a65b485 100644
+--- a/include/system.h
++++ b/include/system.h
+@@ -181,7 +181,7 @@ public:
+ 	void addGfxObject(GfxobjInfo*);
+ 	void attachObjs();
+ 	void detachObjs();
+-	void invalidateObjs(u32, u32);
++	void invalidateObjs(uintptr_t, uintptr_t); // PC: address bounds
+ 	void addTexture(Texture*, immut char*);
+ 	Shape* getShape(immut char*, immut char*, immut char*, bool);
+ 	void initLFlares(int);
+@@ -258,8 +258,10 @@ public:
+ 	// the vtable has to be at 0x1A0, so it's in the middle, yes.
+ 	virtual void initSoftReset();                                                                                       // _08
+ 	virtual RandomAccessStream* openFile(immut char* path, bool isRelativePath = true, bool = true) { return nullptr; } // _0C
+-	virtual u32 copyRamToCache(u32, u32, u32) { return 0; }                                                             // _10
+-	virtual void copyCacheToRam(u32, u32, u32) { }                                                                      // _14
++	// PC: first arg is a host main-memory address — pointer-width on LP64
++	// (second is an ARAM-cache offset, genuinely 32-bit).
++	virtual u32 copyRamToCache(uintptr_t, u32, u32) { return 0; }                                                       // _10
++	virtual void copyCacheToRam(uintptr_t, u32, u32) { }                                                                // _14
+ 	virtual void copyWaitUntilDone() { }                                                                                // _18
+ 	virtual void copyCacheToTexture(CacheTexture*) { }                                                                  // _1C
+ #if defined(VERSION_PIKIDEMO)                                                                                           //
+@@ -376,8 +378,8 @@ public:
+ 
+ 	virtual void initSoftReset();                                                                    // _08
+ 	virtual RandomAccessStream* openFile(immut char* path, bool isRelativePath = true, bool = true); // _0C
+-	virtual u32 copyRamToCache(u32, u32, u32);                                                       // _10
+-	virtual void copyCacheToRam(u32, u32, u32);                                                      // _14
++	virtual u32 copyRamToCache(uintptr_t, u32, u32);                                                 // _10
++	virtual void copyCacheToRam(uintptr_t, u32, u32);                                                // _14
+ 	virtual void copyWaitUntilDone();                                                                // _18
+ 	virtual void copyCacheToTexture(CacheTexture*);                                                  // _1C
+ #if defined(VERSION_PIKIDEMO)                                                                        //
+@@ -420,7 +422,7 @@ public:
+ 
+ 	// _00      = VTBL
+ 	// _00-_248 = StdSystem
+-	u32 mHeapStart;                                  // _244
++	uintptr_t mHeapStart;                            // _244 - PC: host address, pointer-width
+ 	u32 mHeapEnd;                                    // _248
+ 	Graphics* mDGXGfx;                               // _24C, cast to DGXGraphics in DOL
+ 	SystemClass250* _250;                            // _250, a vestigial pointer related to `System::halt`
+@@ -528,7 +530,7 @@ struct AramStream : public RandomAccessStream {
+ 	virtual void read(void* data, int size)       // _3C (weak)
+ 	{
+ 		int readSize = OSRoundUp32B(size);
+-		gsys->copyCacheToRam((u32)data, mBaseAddress + mOffset, readSize);
++		gsys->copyCacheToRam((uintptr_t)data, mBaseAddress + mOffset, readSize);
+ 		gsys->copyWaitUntilDone();
+ 		mOffset += readSize;
+ 	}
+diff --git a/include/types.h b/include/types.h
+index 5aa35a0..4f4c3cb 100644
+--- a/include/types.h
++++ b/include/types.h
+@@ -14,7 +14,7 @@ typedef unsigned __int8 u8;
+ typedef unsigned __int16 u16;
+ typedef unsigned __int32 u32;
+ typedef unsigned __int64 u64;
+-#else
++#elif defined(__MWERKS__)
+ typedef signed char s8;
+ typedef signed short s16;
+ typedef signed long s32;
+@@ -23,6 +23,17 @@ typedef unsigned char u8;
+ typedef unsigned short u16;
+ typedef unsigned long u32;
+ typedef unsigned long long u64;
++#else
++// Host (PC) build: `long` is 8 bytes on LP64, so the 32-bit types must be
++// `int`-based or every struct in the game changes layout.
++typedef signed char s8;
++typedef signed short s16;
++typedef signed int s32;
++typedef signed long long s64;
++typedef unsigned char u8;
++typedef unsigned short u16;
++typedef unsigned int u32;
++typedef unsigned long long u64;
+ #endif
+ 
+ // Volatile types
+@@ -246,6 +257,23 @@ inline void padStack(void)
+ #define TRAP_UNIMPLEMENTED ((void)0) /* Replace me */
+ #endif // clang-format on
+ 
++// Same trap, for a NON-VOID stub. On MWCC `asm { trap }` never returns, so a
++// stub body needs no return statement and retail's PPC has none. Under clang
++// TRAP_UNIMPLEMENTED is a no-op, so those functions fall off the end: at -O0
++// that hands back register residue, and at -O2 clang marks the path
++// `unreachable` and may delete it AND the caller's downstream code. That is
++// the single largest -O2 blocker in the tree (40 of the 41 -Wreturn-type
++// sites) — see docs/ARCHITECTURE.md.
++//
++// The value is a documented default, not a guess at what the PPC returned:
++// on PPC nothing is returned because the trap fires first. Deterministic and
++// harmless beats register residue either way.
++#ifdef __MWERKS__ // clang-format off
++#define TRAP_UNIMPLEMENTED_RET(value) TRAP_UNIMPLEMENTED
++#else
++#define TRAP_UNIMPLEMENTED_RET(value) do { TRAP_UNIMPLEMENTED; return (value); } while (0)
++#endif // clang-format on
++
+ // Documenting MetroWerks intrinsic functions for PowerPC and placing them behind macros for portability.
+ #ifdef __MWERKS__
+ #define __mwerks_eieio()                  /* void   */ __eieio()                  //

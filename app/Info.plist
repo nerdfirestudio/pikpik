@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Expose Documents/ in the Files app so the user can copy the extracted
+	     disc data into Documents/gamedata (and pull saves back off the
+	     device). This is the ONLY way the game data reaches a sandboxed app.
+
+	     Why a merged partial plist rather than build settings: Xcode's
+	     INFOPLIST_KEY_ mechanism does not emit UIFileSharingEnabled, so the
+	     generated-plist route alone cannot set it. GENERATE_INFOPLIST_FILE=YES
+	     plus INFOPLIST_FILE merges this file's keys into the generated ones. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
+	<!-- Save sync (settings.ini [sync], off unless configured) talks to a
+	     server on the user's own network over plain HTTP, which App Transport
+	     Security blocks by default.
+
+	     NSAllowsLocalNetworking rather than NSAllowsArbitraryLoads: it lifts
+	     the requirement for LAN destinations only (.local, link-local and the
+	     private IPv4 ranges) and leaves ATS enforced for everything else. A
+	     server reached over anything OTHER than the LAN — a VPN address in
+	     the 100.64/10 CGNAT range, say, or a public host — is NOT covered,
+	     and the right fix there is to put the server behind TLS and use an
+	     https:// URL rather than to widen this key. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+
+	<!-- iOS 14+ gates local-network access behind a user prompt, and an app
+	     without this key is denied it silently — the sync client would just
+	     report the server as unreachable, with nothing on screen to say why. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Pikmin syncs your save file with the sync server on your local network.</string>
+</dict>
+</plist>

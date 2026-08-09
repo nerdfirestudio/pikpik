@@ -1,0 +1,1181 @@
+diff --git a/src/sysBootup.cpp b/src/sysBootup.cpp
+index 985997c..53e9884 100644
+--- a/src/sysBootup.cpp
++++ b/src/sysBootup.cpp
+@@ -5,11 +5,59 @@
+ /**
+  * @todo: Documentation
+  */
++#if defined(TARGET_PC)
++#include <cstdlib>
++extern "C" void pc_card_selftest(void);          // pc_card.cpp
++extern "C" void pc_crash_handler_install(void);  // pc_crash.cpp
++extern "C" void pc_input_early_init(void);       // pc_input_rec.cpp
++extern "C" void pc_uninit_arm(void);              // pc_uninit.cpp
++extern "C" void pc_sync_startup(void);           // pc_sync.cpp
++#endif
++
+ TERNARY_BUILD_MATCHING(void, int) main(int argc, char* argv[])
+ {
++#if defined(TARGET_PC)
++	// First thing, before anything can fault: real gameplay crashes can only
++	// be found by a human (headless input cannot play), so the binary reports
++	// its own backtrace rather than needing a re-run under lldb. Allocates
++	// nothing — see pc_crash.cpp.
++	pc_crash_handler_install();
++	// Replay needs a fixed timestep, and system.cpp caches PC_FIXED_DT on its
++	// first read — so the default has to be set before the game loop starts.
++	// Touches only the environment; allocates nothing.
++	pc_input_early_init();
++	// PC_UNINIT_PROBE=1: arm the -Wconditional-uninitialized probe here rather
++	// than on its first hit, so "no site was reached" is a REPORTED result and
++	// not indistinguishable from "the probe was never wired up". Reads one
++	// environment variable and calls atexit; allocates nothing.
++	pc_uninit_arm();
++#endif
++#if defined(TARGET_PC)
++	// PC_CARD_SELFTEST=1: exercise the memory-card shim and exit, without
++	// booting the game (pc_card.cpp).
++	if (getenv("PC_CARD_SELFTEST")) {
++		pc_card_selftest();
++		exit(0);
++	}
++	// Save sync (settings.ini [sync]; off unless configured). Must run BEFORE
++	// the game can mount the memory card: reconciling afterwards would mean
++	// the game had already loaded the old save and then had the file replaced
++	// underneath it. Blocking, but with a short timeout — an unreachable
++	// server costs a few seconds and drops to offline. No-op when unset.
++	pc_sync_startup();
++#endif
+ 	gsys->Initialise();
+ 	nodeMgr = new NodeMgr();
+ 	gsys->run(new PlugPikiApp());
+ 
+ 	OSErrorLine(29, "End of demo");
++#if defined(TARGET_PC)
++	// Falling off the end is legal for main() ONLY — the standard gives main an
++	// implicit `return 0`. The iOS build renames this function to SDL_main
++	// (-Dmain=SDL_main, so SDL2's UIKit backend can own UIApplicationMain),
++	// which loses that exemption: without this the return value is register
++	// residue and -Werror=return-type rejects the TU. Guarded because the
++	// matching build's return type is void.
++	return 0;
++#endif
+ }
+diff --git a/src/sysCommon/ayuStack.cpp b/src/sysCommon/ayuStack.cpp
+index 069a9c7..3145ad3 100644
+--- a/src/sysCommon/ayuStack.cpp
++++ b/src/sysCommon/ayuStack.cpp
+@@ -35,9 +35,10 @@ void AyuStack::create(immut char* name, int allocFlags, void* stackBase, int sta
+ 	mAllocType         = allocFlags;
+ 	mIsActive          = true;
+ 	mName              = name;
+-	mInitialStackTop   = (u32)stackBase;
++	mInitialStackTop   = (uintptr_t)stackBase;
+ 	mInitialStackLimit = mInitialStackTop + stackSizeBytes;
+ 	mSize              = mInitialStackLimit - mInitialStackTop;
++	mPeakSize          = 0; /* PC: high-water tracking, see AyuStack.h */
+ 	mProtectOverflow   = enableOverflowGuard;
+ 	if (mProtectOverflow) {
+ 		((u32*)mInitialStackTop)[0] = AYU_STACK_GUARD_WORD; // Guard for overflow detection.
+@@ -64,7 +65,7 @@ void AyuStack::reset()
+ void AyuStack::checkStack()
+ {
+ 	if ((mAllocType & AYU_STACK_GROW_UP)) {
+-		u32 newTop = mStackTop - *(u32*)(mStackTop - 8);
++		uintptr_t newTop = mStackTop - *(u32*)(mStackTop - 8); /* PC: was u32 - address */
+ #if defined(VERSION_GPIJ01) || defined(VERSION_DPIJ01_PIKIDEMO)
+ 		if (newTop != mInitialStackTop)
+ #else
+@@ -126,17 +127,18 @@ void* AyuStack::push(int requestedSizeBytes)
+ 		}
+ 
+ 		u32 previousSize;
+-		u32 stackStart;
++		uintptr_t stackStart; /* PC: was u32 — truncated the heap pointer on LP64 */
+ 		if (mStackTop != mInitialStackTop) {
+-			int tmp      = mStackTop - 8;
+-			previousSize = *(u32*)(mStackTop - 8);
+-			stackStart   = tmp;
++			uintptr_t tmp = mStackTop - 8;
++			previousSize  = *(u32*)(mStackTop - 8);
++			stackStart    = tmp;
+ 		} else {
+ 			previousSize = 0;
+ 			stackStart   = mStackTop;
+ 		}
+ 
+ 		mTotalSize += (requestedSizeBytes + 8);
++		if (mTotalSize > mPeakSize) { mPeakSize = mTotalSize; } /* PC: high-water */
+ 		mStackTop += (requestedSizeBytes + 8);
+ 		*(u32*)(mStackTop - 8) = previousSize + (requestedSizeBytes + 8);
+ 
+@@ -149,6 +151,7 @@ void* AyuStack::push(int requestedSizeBytes)
+ 		}
+ 
+ 		mTotalSize += (requestedSizeBytes + 8);
++		if (mTotalSize > mPeakSize) { mPeakSize = mTotalSize; } /* PC: high-water */
+ 		mStackLimit -= (requestedSizeBytes + 8);
+ 		*(u32*)mStackLimit = (requestedSizeBytes + 8);
+ 		return (void*)(mStackLimit + 8);
+@@ -195,7 +198,7 @@ AyuCache::AyuCache(u32 cacheSize)
+ 
+ 	s32 alignedSize = OSRoundUp32B(cacheSize);
+ 	char* bufAddr   = new char[(alignedSize / 4) * 4];
+-	init((u32)bufAddr, (u32)bufAddr + alignedSize);
++	init((uintptr_t)bufAddr, (uintptr_t)bufAddr + alignedSize);
+ }
+ 
+ /**
+@@ -203,7 +206,7 @@ AyuCache::AyuCache(u32 cacheSize)
+  * @param bufferStart Start address of cache buffer.
+  * @param bufferEnd End address of cache buffer.
+  */
+-void AyuCache::init(u32 bufferStart, u32 bufferEnd)
++void AyuCache::init(uintptr_t bufferStart, uintptr_t bufferEnd)
+ {
+ 	mTotalAllocatedUnits            = 0;
+ 	mTotalCacheSizeBytes            = (bufferEnd - bufferStart);
+diff --git a/src/sysCommon/graphics.cpp b/src/sysCommon/graphics.cpp
+index 2aae23e..ebb3c8a 100644
+--- a/src/sysCommon/graphics.cpp
++++ b/src/sysCommon/graphics.cpp
+@@ -562,6 +562,19 @@ void Material::read(RandomAccessStream& input)
+  */
+ void Font::setTexture(Texture* tex, int numRows, int numCols)
+ {
++#ifdef TARGET_PC
++	// Boot-time crash guard (SIGSEGV at 0xc in the wild, 2026-07-25): a
++	// failed font load (launching from a directory without gamedata, or
++	// PC_GAME_ROOT unset/wrong) reaches here as NULL. Fail with a message
++	// instead of dereferencing it.
++	if (!tex) {
++		fprintf(stderr,
++		        "[PC] FATAL: font texture failed to load (NULL). The game data was not\n"
++		        "[PC] found — run from build-m1 (where gamedata/ lives) or set\n"
++		        "[PC] PC_GAME_ROOT=/path/to/gamedata.\n");
++		exit(1);
++	}
++#endif
+ 	mTexture    = tex;
+ 	mChars      = new FontChar[numRows * numCols];
+ 	mCharWidth  = mTexture->mWidth / numRows;
+@@ -1411,7 +1424,7 @@ int Graphics::calcLighting(f32 intensity)
+  */
+ int Graphics::calcSphereLighting(immut Vector3f&, f32)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+@@ -1420,7 +1433,7 @@ int Graphics::calcSphereLighting(immut Vector3f&, f32)
+  */
+ int Graphics::calcBoxLighting(immut BoundBox&)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+diff --git a/src/sysCommon/id32.cpp b/src/sysCommon/id32.cpp
+index 6cb9245..14f11e1 100644
+--- a/src/sysCommon/id32.cpp
++++ b/src/sysCommon/id32.cpp
+@@ -69,11 +69,9 @@ bool ID32::match(u32 id, char wild) immut
+  */
+ void ID32::updateID()
+ {
+-	char* id = reinterpret_cast<char*>(&mId);
+-
+-	for (int i = 0; i < 4; i++) {
+-		id[i] = this->mStringID[i];
+-	}
++	/* PC: compose big-endian — the numeric ID must equal the multi-char
++	   literal ('MODL' etc.) and on-disc words regardless of host endian. */
++	mId = ((u32)(u8)mStringID[0] << 24) | ((u32)(u8)mStringID[1] << 16) | ((u32)(u8)mStringID[2] << 8) | (u32)(u8)mStringID[3];
+ }
+ 
+ /**
+@@ -81,11 +79,11 @@ void ID32::updateID()
+  */
+ void ID32::updateString()
+ {
+-	char* id = reinterpret_cast<char*>(&mId);
+-
+-	for (int i = 0; i < 4; i++) {
+-		mStringID[i] = id[i];
+-	}
++	/* PC: decompose big-endian (see updateID). */
++	mStringID[0] = (char)(mId >> 24);
++	mStringID[1] = (char)(mId >> 16);
++	mStringID[2] = (char)(mId >> 8);
++	mStringID[3] = (char)mId;
+ 
+ 	mStringID[4] = 0;
+ }
+@@ -123,12 +121,12 @@ bool ID32::operator!=(u32 other) immut
+  */
+ void ID32::write(RandomAccessStream& stream) immut
+ {
+-	immut char* id = reinterpret_cast<immut char*>(&mId);
+-
+-	stream.writeByte(id[3]);
+-	stream.writeByte(id[2]);
+-	stream.writeByte(id[1]);
+-	stream.writeByte(id[0]);
++	/* PC: mirror the portable read — the GC wrote `((char*)&mId)[3..0]`, i.e.
++	   least-significant byte of mId first. */
++	stream.writeByte((u8)(mId & 0xFF));
++	stream.writeByte((u8)((mId >> 8) & 0xFF));
++	stream.writeByte((u8)((mId >> 16) & 0xFF));
++	stream.writeByte((u8)((mId >> 24) & 0xFF));
+ }
+ 
+ /**
+@@ -137,11 +135,17 @@ void ID32::write(RandomAccessStream& stream) immut
+  */
+ void ID32::read(RandomAccessStream& stream)
+ {
+-	char* id = reinterpret_cast<char*>(&mId);
+-	id[3]    = stream.readByte();
+-	id[2]    = stream.readByte();
+-	id[1]    = stream.readByte();
+-	id[0]    = stream.readByte();
++	/* PC: the GC did `((char*)&mId)[3..0] = readByte()`, i.e. the first byte
++	   read is the LEAST significant of mId and the fourth is the most
++	   significant (big-endian host semantics). Compose that portably so the
++	   numeric ID matches the multi-char literal on any host endian — the raw
++	   byte overlay byte-swapped every ID on little-endian (e.g. the '.gen'
++	   version 'v0.1' misread as '1.0v', breaking version-gated stream reads). */
++	u8 b0 = stream.readByte();
++	u8 b1 = stream.readByte();
++	u8 b2 = stream.readByte();
++	u8 b3 = stream.readByte();
++	mId   = ((u32)b3 << 24) | ((u32)b2 << 16) | ((u32)b1 << 8) | (u32)b0;
+ 
+ 	updateString();
+ }
+diff --git a/src/sysCommon/matMath.cpp b/src/sysCommon/matMath.cpp
+index 19329f9..eeea677 100644
+--- a/src/sysCommon/matMath.cpp
++++ b/src/sysCommon/matMath.cpp
+@@ -5,7 +5,7 @@
+ 
+ f32 sintable[0x1000];
+ f32 costable[0x1000];
+-immut Matrix4f Matrix4f::ident;
++Matrix4f Matrix4f::ident; // PC: not immut — see the declaration in Matrix4f.h
+ 
+ /**
+  * @todo: Documentation
+diff --git a/src/sysCommon/node.cpp b/src/sysCommon/node.cpp
+index d70fdb2..085df56 100644
+--- a/src/sysCommon/node.cpp
++++ b/src/sysCommon/node.cpp
+@@ -153,7 +153,7 @@ void Node::render(Graphics& gfx)
+  * @todo: Documentation
+  * @note UNUSED Size: 000128 (Matching by size)
+  */
+-SRTNode::SRTNode(immut char* name = "<SRTNode>")
++SRTNode::SRTNode(immut char* name) /* PC: default arg on redeclaration removed */
+     : Node(name)
+ {
+ 	setPosition(Vector3f(0.0f, 0.0f, 0.0f));
+diff --git a/src/sysCommon/shapeBase.cpp b/src/sysCommon/shapeBase.cpp
+index 231cf6c..f15a606 100644
+--- a/src/sysCommon/shapeBase.cpp
++++ b/src/sysCommon/shapeBase.cpp
+@@ -961,8 +961,20 @@ void AnimData::makeAnimSRT(int boneId, immut Matrix4f* parent, Matrix4f* output,
+ 	Matrix4f* boneTransform;
+ 
+ 	bool check = true;
++#ifdef TARGET_PC
++	/* PC: bypass the per-frame bone-matrix cache. FrameCacher and
++	   AnimCacheInfo are two overlapping views of one block with GC 32-bit
++	   field offsets (Animator.h _14/_18/_1C) and u32 mBoneMatrices[1] aliased
++	   as Matrix4f — on LP64 the 8-byte pointers shift the layout, so this read
++	   pulled a Matrix4f* out of float matrix data (1.0f -> 0x3f80000000000000)
++	   and crashed PSMTXConcat. The cache is only a recompute-avoidance opt;
++	   the direct-compute path below is identical output. See also the gated
++	   cacheFrameSpace call in updateAnim. */
++	if (false) {
++#else
+ 	if ((info->mFlags & AnimDataFlags::AllComponentsStatic) != AnimDataFlags::AllComponentsStatic
+ 	    && mAnimInfoList[frameNum].mCachedMtxBlock) {
++#endif
+ 		AnimCacheInfo* cache = static_cast<AnimCacheInfo*>(mAnimInfoList[frameNum].mCachedMtxBlock);
+ 		if (cache->mBoneMtxList[boneId]) {
+ 			check = false;
+@@ -1766,6 +1778,16 @@ void BaseShape::importIni(RandomAccessStream& stream)
+ 				mLightGroup.add(light);
+ 				cmd->getToken(true);
+ 				light->loadini(cmd);
++#ifdef TARGET_PC
++				{ // flare-chain debug: lightgroups parsed from shape INIs
++					static int s_n;
++					if (getenv("PC_VERBOSE") && s_n < 8) {
++						s_n++;
++						fprintf(stderr, "[SHPINI] lightgroup joint=%d shape=%s flares=%d\n", jointIdx, Name(),
++						        light->mFlares.Child() ? 1 : 0);
++					}
++				}
++#endif
+ 
+ 			} else if (cmd->isToken("route")) {
+ 				RouteGroup* route = makeRouteGroup();
+@@ -2669,6 +2691,15 @@ void BaseShape::read(RandomAccessStream& stream)
+ 		}
+ 	};
+ 
++#ifdef TARGET_PC
++	{ // flare-chain debug: does the appended light/collision INI ever load?
++		static int s_n;
++		if (getenv("PC_VERBOSE") && s_n < 10) {
++			s_n++;
++			fprintf(stderr, "[SHPINI] pending=%d shape=%s\n", stream.getPending(), Name());
++		}
++	}
++#endif
+ 	if (stream.getPending() != 0) {
+ 		importIni(stream);
+ 	}
+@@ -3293,7 +3324,12 @@ void BaseShape::updateAnim(Graphics& gfx, immut Matrix4f& mtx, f32* p3)
+ 			}
+ 			f32* frame = (p3) ? p3 : &mAnimOverrides[i]->mCurrentFrame;
+ 
++#ifdef TARGET_PC
++			// PC: frame cache disabled (see makeAnimSRT) — never allocate it.
++			if (false) {
++#else
+ 			if (mFrameCacher && data->mAnimFlags & ANIMFLAG_UseCache) {
++#endif
+ 				int frameNum = int(*frame);
+ 				if (frameNum >= data->mTotalFrameCount) {
+ 					ERROR("updateAnim: too large a frame number : %d / %d, %f\n", frameNum, data->mTotalFrameCount, *frame);
+@@ -3374,6 +3410,15 @@ static inline void addMatrixWeights(register f32* animMtx, register f32* weighte
+ 		ps_madd  f3, f2, f0, f3;
+ 		psq_st   f3, 0x28 (animMtx), 0, 0;
+ 	}
++#else
++	// Portable equivalent of the paired-single asm above: madd the 12 matrix
++	// floats (6 quantized pairs, 0x00..0x28) by the broadcast weight. With the
++	// MWERKS-only asm compiled out, this function was EMPTY on PC — envelope
++	// matrices stayed all-zero and every partial-weight (blend-band) vertex
++	// collapsed to the origin: the plucked-Pikmin missing pelvis band.
++	for (int i = 0; i < 12; i++) {
++		animMtx[i] += weightedMtx[i] * weights[0];
++	}
+ #endif
+ }
+ 
+diff --git a/src/sysCommon/shpLightFlares.cpp b/src/sysCommon/shpLightFlares.cpp
+index 0d7bd9d..fdf1c30 100644
+--- a/src/sysCommon/shpLightFlares.cpp
++++ b/src/sysCommon/shpLightFlares.cpp
+@@ -178,6 +178,17 @@ void LightGroup::refresh(Graphics& gfx, immut Matrix4f* lightMtx)
+ 			f32 flareSize          = mtxVec->length() * flare->mSize;
+ 			Vector2f size(flareSize, flareSize);
+ 
++#ifdef TARGET_PC
++			{ // flare-chain reachability (warp glow debug): first few adds
++				static int s_n;
++				if (getenv("PC_VERBOSE") && s_n < 4) {
++					s_n++;
++					fprintf(stderr, "[FLARE] add pos=(%.0f,%.0f,%.0f) size=%.1f col=(%d,%d,%d,%d)\n",
++					        flarePos.x, flarePos.y, flarePos.z, flareSize,
++					        mLightColour.r, mLightColour.g, mLightColour.b, mLightColour.a);
++				}
++			}
++#endif
+ 			mFlareGroup->addLFlare(mLightColour, flarePos, size, nullptr, nullptr);
+ 		}
+ 	}
+diff --git a/src/sysCommon/stdSystem.cpp b/src/sysCommon/stdSystem.cpp
+index a9fe3f2..1b49335 100644
+--- a/src/sysCommon/stdSystem.cpp
++++ b/src/sysCommon/stdSystem.cpp
+@@ -389,13 +389,13 @@ void StdSystem::detachObjs()
+  * @param lowerBound Inclusive lower address bound.
+  * @param upperBound Exclusive upper address bound.
+  */
+-void StdSystem::invalidateObjs(u32 lowerBound, u32 upperBound)
++void StdSystem::invalidateObjs(uintptr_t lowerBound, uintptr_t upperBound)
+ {
+ 	GfxobjInfo* next;
+ 	for (GfxobjInfo* c = mGfxobjInfo.mNext; c != &mGfxobjInfo;) {
+ 		next = c->mNext;
+ 
+-		u32 address = reinterpret_cast<u32>(c);
++		uintptr_t address = reinterpret_cast<uintptr_t>(c);
+ 		if (address >= lowerBound && address < upperBound) {
+ 			c->remove();
+ 		}
+@@ -530,6 +530,18 @@ void StdSystem::flushLFlares(Graphics& gfx)
+ 	FOREACH_NODE(LFlareGroup, mFlareGroupList->mChild, flareGroup)
+ 	{
+ 		if (flareGroup->mLFInfo) {
++#ifdef TARGET_PC
++			{ // warp-glow debug: are additive flares actually flushed?
++				static int s_n;
++				if (getenv("PC_VERBOSE") && s_n < 4) {
++					s_n++;
++					int cnt = 0;
++					for (LFInfo* i2 = flareGroup->mLFInfo; i2; i2 = i2->mPrevInfo) cnt++;
++					fprintf(stderr, "[FLARE] flush group tex=%p mat=%p blend=%d count=%d\n",
++					        (void*)flareGroup->mTexture, (void*)flareGroup->mMaterial, flareGroup->mBlendMode, cnt);
++				}
++			}
++#endif
+ 			if (flareGroup->mMaterial) {
+ 				gfx.useMaterial(flareGroup->mMaterial);
+ 			} else {
+@@ -600,7 +612,7 @@ void StdSystem::loadBundle(immut char* pPath, bool loadWithCache)
+ 				cacheTex->mTexImage    = texImg;
+ 				newTex                 = cacheTex;
+ 				texImg->importBti(cacheTex, *fs, (u8*)OSRoundUp32B(mGraphics->mMatrixBuffer));
+-				cacheTex->mAramAddress = copyRamToCache((u32)texImg->mTextureData, texImg->mDataSize, 0);
++				cacheTex->mAramAddress = copyRamToCache((uintptr_t)texImg->mTextureData, texImg->mDataSize, 0);
+ 				copyWaitUntilDone();
+ 				texImg->mTextureData = nullptr;
+ 			} else {
+@@ -696,7 +708,7 @@ void TextureCacher::cacheTexture(CacheTexture* tex)
+ 			if (!alloc) {
+ 				ERROR("Could not get memory from cache! %d : %d\n", texSize, largestBlockFree);
+ 			}
+-			tex->mTexImage->mTextureData = (void*)OSRoundDown32B((u32)alloc + 0x33);
++			tex->mTexImage->mTextureData = (void*)OSRoundDown32B((uintptr_t)alloc + 0x33);
+ 			TexCacheInfo* info           = (TexCacheInfo*)alloc;
+ 			info->_0C                    = &tex->mActiveCache;
+ 			tex->mActiveCache            = info;
+diff --git a/src/sysCommon/stream.cpp b/src/sysCommon/stream.cpp
+index 09f50e6..4ea0607 100644
+--- a/src/sysCommon/stream.cpp
++++ b/src/sysCommon/stream.cpp
+@@ -15,6 +15,11 @@ int Stream::readInt()
+ {
+ 	int i;
+ 	read(&i, sizeof(int));
++#if defined(TARGET_PC)
++	/* PC: stream data is big-endian (disc-authored); swap on LE hosts —
++	   the write side's WIN32 blocks below are Nintendo's own precedent. */
++	i = (int)__builtin_bswap32((u32)i);
++#endif
+ 	return i;
+ }
+ 
+@@ -35,6 +40,9 @@ s16 Stream::readShort()
+ {
+ 	s16 s;
+ 	read(&s, sizeof(s16));
++#if defined(TARGET_PC)
++	s = (s16)__builtin_bswap16((u16)s);
++#endif
+ 	return s;
+ }
+ 
+@@ -43,9 +51,12 @@ s16 Stream::readShort()
+  */
+ f32 Stream::readFloat()
+ {
+-	f32 f;
+-	read(&f, sizeof(f32));
+-	return f;
++	union { f32 f; u32 u; } v;
++	read(&v.f, sizeof(f32));
++#if defined(TARGET_PC)
++	v.u = __builtin_bswap32(v.u);
++#endif
++	return v.f;
+ }
+ 
+ /**
+@@ -90,7 +101,7 @@ void Stream::readString(String& str)
+ void Stream::writeInt(int i)
+ {
+ 	int result = i;
+-#ifdef WIN32
++#if defined(WIN32) || defined(TARGET_PC)
+ 	result = (((result & 0xFF000000) >> 24) | ((result & 0xFF0000) >> 8) | ((result & 0xFF00) << 8) | (result << 24));
+ #endif
+ 	write(&result, sizeof(result));
+@@ -110,7 +121,7 @@ void Stream::writeByte(u8 c)
+ void Stream::writeShort(s16 _s)
+ {
+ 	s16 s = _s;
+-#ifdef WIN32
++#if defined(WIN32) || defined(TARGET_PC)
+ 	s = (((s & 0xFF00) >> 8) | (s << 8));
+ #endif
+ 	write(&s, sizeof(s16));
+@@ -121,12 +132,12 @@ void Stream::writeShort(s16 _s)
+  */
+ void Stream::writeFloat(f32 f)
+ {
+-	f32 result = f;
+-#ifdef WIN32
+-	int c  = *static_cast<int*>(&result);
+-	result = ((u8)c << 24) | ((c & 0xFF00) << 8) | ((c & 0xFF0000) >> 8) | ((c & 0xFF000000) >> 24);
++	union { f32 f; u32 u; } v;
++	v.f = f;
++#if defined(WIN32) || defined(TARGET_PC)
++	v.u = __builtin_bswap32(v.u); /* PC: the original WIN32 block's intent, minus its invalid cast */
+ #endif
+-	write(&result, sizeof(f32));
++	write(&v.f, sizeof(f32));
+ }
+ 
+ /**
+diff --git a/src/sysDolphin/dgxGraphics.cpp b/src/sysDolphin/dgxGraphics.cpp
+index fca812b..f41c39e 100644
+--- a/src/sysDolphin/dgxGraphics.cpp
++++ b/src/sysDolphin/dgxGraphics.cpp
+@@ -376,6 +376,12 @@ void DGXGraphics::useDList(u32 num)
+  */
+ u32 DGXGraphics::compileMaterial(Material* mat)
+ {
++#if defined(TARGET_PC)
++	/* PC: GX display-list recording isn't captured (the FIFO proxies apply
++	   state immediately); leaving mDisplayListPtr null routes setMaterial
++	   through its complete direct-setup fallback. */
++	return 0;
++#endif
+ 	if (!(mat->mFlags & MATFLAG_PVW)) {
+ 		return 0;
+ 	}
+@@ -929,6 +935,20 @@ void DGXGraphics::useMatrix(immut Matrix4f& mtx, int a)
+ void DGXGraphics::useTexture(Texture* texture, int id)
+ {
+ 	mHasTexGen = FALSE;
++#ifdef TARGET_PC
++	// PC_TEXBIND=1: name every texture bind (and expose useTexture's pointer-
++	// dedup skips) — for chasing draws that sample a stale/mystery texture.
++	if (getenv("PC_TEXBIND")) {
++		static const Texture* lastLogged;
++		if (texture && texture != lastLogged) {
++			lastLogged = texture;
++			extern int pc_gx_texmap_handle(int);
++			fprintf(stderr, "[TEXBIND] id=%d tex=%p fmt=%d %dx%d %s\n", id, (void*)texture,
++			        (int)texture->mTexFormat, (int)texture->mWidth, (int)texture->mHeight,
++			        (texture == mActiveTexture[id]) ? "DEDUP-SKIP" : "bind");
++		}
++	}
++#endif
+ 	if (!texture || texture != mActiveTexture[id]) {
+ 		if (texture) {
+ 			texture->makeResident();
+@@ -1071,6 +1091,25 @@ void DGXGraphics::setMaterial(Material* mat, bool p2)
+ 			GXSetTevColorS10(GX_TEVREG0, *(GXColorS10*)&mat->mTevInfo->mTevColRegs[0].mAnimatedColor);
+ 			GXSetTevColorS10(GX_TEVREG1, *(GXColorS10*)&mat->mTevInfo->mTevColRegs[1].mAnimatedColor);
+ 			GXSetTevColorS10(GX_TEVREG2, *(GXColorS10*)&mat->mTevInfo->mTevColRegs[2].mAnimatedColor);
++			// PC_MATTRACE: per-register anim state — is a TEV colour register meant
++			// to be animated (frames>0) and what value is being latched this draw?
++			if (getenv("PC_MATTRACE")) {
++				static unsigned tseen[128]; static int tnseen;
++				for (int r = 0; r < 3; r++) {
++					PVWTevColReg& cr = mat->mTevInfo->mTevColRegs[r];
++					unsigned key = ((unsigned)r << 28) ^ ((unsigned)cr.mAnimFrameCount << 16)
++					             ^ ((unsigned)(short)cr.mAnimatedColor.a << 1) ^ (unsigned)mat->mTevInfo->mTevStageCount;
++					bool dup = false;
++					for (int s = 0; s < tnseen; s++) if (tseen[s] == key) { dup = true; break; }
++					if (!dup && tnseen < 128) {
++						tseen[tnseen++] = key;
++						fprintf(stderr, "[MATREG] nst=%d reg%d frames=%d speed=%.2f cur=%.1f rgba=(%d,%d,%d,%d) ckeys=%d akeys=%d\n",
++						       mat->mTevInfo->mTevStageCount, r, cr.mAnimFrameCount, cr.mAnimSpeed, cr.mCurrentAnimFrame,
++						       cr.mAnimatedColor.r, cr.mAnimatedColor.g, cr.mAnimatedColor.b, cr.mAnimatedColor.a,
++						       (int)cr.mColorAnimData.mInfo.mSize, (int)cr.mAlphaAnimData.mInfo.mSize);
++					}
++				}
++			}
+ 
+ 			GXSetNumTevStages(mat->mTevInfo->mTevStageCount);
+ 
+@@ -1081,6 +1120,32 @@ void DGXGraphics::setMaterial(Material* mat, bool p2)
+ 				GXSetTevKAlphaSel(GXTevStageID(i), GXTevKAlphaSel(stage.mTevKAlphaSel));
+ 			}
+ 
++			// PC_MATTRACE: dump PVW material texmap/stage layout to see whether the
++			// diffuse texture is sampled by a stage the shim ignores (only stage 0).
++			if (getenv("PC_MATTRACE")) {
++				static unsigned seen[256]; static int nseen;
++				int nst = mat->mTevInfo->mTevStageCount;
++				int ntd = mat->mTextureInfo.mTextureDataCount;
++				int m0 = nst > 0 ? mat->mTevInfo->mTevStages[0].mTexMapID : -1;
++				int m1 = nst > 1 ? mat->mTevInfo->mTevStages[1].mTexMapID : -1;
++				int m2 = nst > 2 ? mat->mTevInfo->mTevStages[2].mTexMapID : -1;
++				unsigned key = ((unsigned)(nst & 0xf) << 24) | ((unsigned)(ntd & 0xf) << 20)
++				             | ((unsigned)(m0 & 0xff) << 12) | ((unsigned)(m1 & 0xff) << 4) | (unsigned)(m2 & 0xf);
++				bool dup = false;
++				for (int s = 0; s < nseen; s++) if (seen[s] == key) { dup = true; break; }
++				if (!dup && nseen < 256) {
++					seen[nseen++] = key;
++					int td0 = ntd > 0 && mat->mTextureInfo.mTextureData[0].mTexture ? 1 : 0;
++					int td1 = ntd > 1 && mat->mTextureInfo.mTextureData[1].mTexture ? 1 : 0;
++					int td2 = ntd > 2 && mat->mTextureInfo.mTextureData[2].mTexture ? 1 : 0;
++					fprintf(stderr, "[MATTRACE] nst=%d ntd=%d stageMaps=[%d,%d,%d] texData=[%d,%d,%d] matc=(%d,%d,%d,a%d) li=%.2f ctrl=%x baseTex=%s flags=%x\n",
++					        nst, ntd, m0, m1, m2, td0, td1, td2,
++					        mat->mColourInfo.mColour.r, mat->mColourInfo.mColour.g, mat->mColourInfo.mColour.b,
++					        mat->mColourInfo.mColour.a, mLightIntensity, (unsigned)mat->mLightingInfo.mCtrlFlag,
++					        mat->mTexture ? "tex" : "NULL", (unsigned)mat->mFlags);
++				}
++			}
++
+ 			Colour color;
+ 			color.set(mat->mColourInfo.mColour.r, mat->mColourInfo.mColour.g, mat->mColourInfo.mColour.b,
+ 			          mLightIntensity * mat->mColourInfo.mColour.a);
+@@ -1478,6 +1543,21 @@ void DGXGraphics::setFog(bool set, immut Colour& color, f32 density, f32 start,
+  */
+ void DGXGraphics::setBlendMode(u8 blendFactor, u8 zMode, u8 blendMode)
+ {
++#ifdef TARGET_PC
++	if (getenv("PC_PTCL_TRACE")) {
++		static unsigned seen[128];
++		static int nseen;
++		unsigned key = ((unsigned)blendFactor << 16) | ((unsigned)zMode << 8) | blendMode;
++		bool found = false;
++		for (int i = 0; i < nseen; i++)
++			if (seen[i] == key) { found = true; break; }
++		if (!found && nseen < 128) {
++			seen[nseen++] = key;
++			fprintf(stderr, "[PTCL] blendFactor=0x%02x (src=%d dst=%d) zMode=0x%02x tevMode=%d\n", blendFactor,
++			        blendFactor & 0xf, blendFactor >> 4, zMode, blendMode);
++		}
++	}
++#endif
+ 	GXSetBlendMode(GX_BM_BLEND, (GXBlendFactor)(blendFactor & 0xf), (GXBlendFactor)(blendFactor >> 4), GX_LO_SET);
+ 
+ 	GXSetZMode((GXBool)((zMode & 8) >> 3), (GXCompare)(zMode & 7), (GXBool)(zMode >> 4));
+@@ -1647,6 +1727,26 @@ void DGXGraphics::drawRotParticle(Camera& cam, immut Vector3f& pos, u16 angle, f
+ 
+ 	gsys->mPolygonCount += 2;
+ 
++#ifdef TARGET_PC
++	// PC_PTCL_TRACE: radius census per active texture — the warp-flash quads
++	// render hard-edged where GC shows a smooth flash; if GC intends these
++	// screen-covering, the size source is wrong on our side.
++	if (getenv("PC_PTCL_TRACE")) {
++		static float rmin[8] = {1e9,1e9,1e9,1e9,1e9,1e9,1e9,1e9}, rmax[8];
++		static void* rtex[8]; static int rn;
++		void* t = (void*)mActiveTexture[0];
++		int slot = -1;
++		for (int i = 0; i < rn; i++) if (rtex[i] == t) { slot = i; break; }
++		if (slot < 0 && rn < 8) { slot = rn++; rtex[slot] = t; }
++		if (slot >= 0) {
++			bool report = radius < rmin[slot] * 0.5f || radius > rmax[slot] * 2.0f;
++			if (radius < rmin[slot]) rmin[slot] = radius;
++			if (radius > rmax[slot]) rmax[slot] = radius;
++			if (report)
++				fprintf(stderr, "[ROTP] tex=%p radius=%.1f pos=(%.0f,%.0f,%.0f)\n", t, radius, pos.x, pos.y, pos.z);
++		}
++	}
++#endif
+ 	// max - 0x2000
+ 	Vector3f vec1(radius * sinShort(angle + 0xE000), radius * cosShort(angle + 0xE000), 0.0f);
+ 	// min + 0x2000
+@@ -1855,8 +1955,17 @@ void DGXGraphics::blatRectangle(immut RectArea& rect)
+ 	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+ 	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
+ 
++#ifdef TARGET_PC
++	// GXColor1u32 expects the GC (big-endian) lane order r<<24|g<<16|b<<8|a; a
++	// raw reinterpret of the byte struct only produces that on GC. On LE hosts
++	// it lands alpha in red and reads alpha=255 — the intro impact-flash wipe
++	// rendered permanently opaque white. Compose explicitly instead.
++	u32 primClr = ((u32)mPrimaryColour.r << 24) | ((u32)mPrimaryColour.g << 16) | ((u32)mPrimaryColour.b << 8) | mPrimaryColour.a;
++	u32 auxClr  = ((u32)mAuxiliaryColour.r << 24) | ((u32)mAuxiliaryColour.g << 16) | ((u32)mAuxiliaryColour.b << 8) | mAuxiliaryColour.a;
++#else
+ 	u32 primClr = *reinterpret_cast<u32*>(&mPrimaryColour);
+ 	u32 auxClr  = *reinterpret_cast<u32*>(&mAuxiliaryColour);
++#endif
+ 	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+ 
+ 	GXPosition3f32(rect.mMinX, rect.mMinY, 0.0f);
+@@ -1939,8 +2048,17 @@ void DGXGraphics::drawRectangle(immut RectArea& bounds, immut RectArea& texCoord
+ 	GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+ 	GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+ 
++#ifdef TARGET_PC
++	// GXColor1u32 expects the GC (big-endian) lane order r<<24|g<<16|b<<8|a; a
++	// raw reinterpret of the byte struct only produces that on GC. On LE hosts
++	// it lands alpha in red and reads alpha=255 — the intro impact-flash wipe
++	// rendered permanently opaque white. Compose explicitly instead.
++	u32 primClr = ((u32)mPrimaryColour.r << 24) | ((u32)mPrimaryColour.g << 16) | ((u32)mPrimaryColour.b << 8) | mPrimaryColour.a;
++	u32 auxClr  = ((u32)mAuxiliaryColour.r << 24) | ((u32)mAuxiliaryColour.g << 16) | ((u32)mAuxiliaryColour.b << 8) | mAuxiliaryColour.a;
++#else
+ 	u32 primClr = *reinterpret_cast<u32*>(&mPrimaryColour);
+ 	u32 auxClr  = *reinterpret_cast<u32*>(&mAuxiliaryColour);
++#endif
+ 
+ 	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+ 	GXPosition3f32(bounds.mMinX + ((offset) ? offset->x : 0.0f), bounds.mMinY + ((offset) ? offset->y : 0.0f), (offset) ? offset->z : 0.0f);
+@@ -1973,8 +2091,17 @@ void DGXGraphics::lineRectangle(immut RectArea& rect)
+ 
+ 	useTexture(nullptr, GX_TEXMAP0);
+ 
++#ifdef TARGET_PC
++	// GXColor1u32 expects the GC (big-endian) lane order r<<24|g<<16|b<<8|a; a
++	// raw reinterpret of the byte struct only produces that on GC. On LE hosts
++	// it lands alpha in red and reads alpha=255 — the intro impact-flash wipe
++	// rendered permanently opaque white. Compose explicitly instead.
++	u32 primClr = ((u32)mPrimaryColour.r << 24) | ((u32)mPrimaryColour.g << 16) | ((u32)mPrimaryColour.b << 8) | mPrimaryColour.a;
++	u32 auxClr  = ((u32)mAuxiliaryColour.r << 24) | ((u32)mAuxiliaryColour.g << 16) | ((u32)mAuxiliaryColour.b << 8) | mAuxiliaryColour.a;
++#else
+ 	u32 primClr = *reinterpret_cast<u32*>(&mPrimaryColour);
+ 	u32 auxClr  = *reinterpret_cast<u32*>(&mAuxiliaryColour);
++#endif
+ 	GXBegin(GX_LINESTRIP, GX_VTXFMT0, 5);
+ 
+ 	GXPosition3f32(rect.mMinX, rect.mMinY, 0.0f);
+@@ -2008,8 +2135,17 @@ void DGXGraphics::fillRectangle(immut RectArea& rect)
+ 
+ 	useTexture(nullptr, GX_TEXMAP0);
+ 
++#ifdef TARGET_PC
++	// GXColor1u32 expects the GC (big-endian) lane order r<<24|g<<16|b<<8|a; a
++	// raw reinterpret of the byte struct only produces that on GC. On LE hosts
++	// it lands alpha in red and reads alpha=255 — the intro impact-flash wipe
++	// rendered permanently opaque white. Compose explicitly instead.
++	u32 primClr = ((u32)mPrimaryColour.r << 24) | ((u32)mPrimaryColour.g << 16) | ((u32)mPrimaryColour.b << 8) | mPrimaryColour.a;
++	u32 auxClr  = ((u32)mAuxiliaryColour.r << 24) | ((u32)mAuxiliaryColour.g << 16) | ((u32)mAuxiliaryColour.b << 8) | mAuxiliaryColour.a;
++#else
+ 	u32 primClr = *reinterpret_cast<u32*>(&mPrimaryColour);
+ 	u32 auxClr  = *reinterpret_cast<u32*>(&mAuxiliaryColour);
++#endif
+ 	GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+ 
+ 	GXPosition3f32(rect.mMinX, rect.mMinY, 0.0f);
+@@ -2133,21 +2269,28 @@ void DGXGraphics::showError(immut char* msg, immut char* file, int line)
+ 	directErase(window, false);
+ 	directPrint(window.mMinX + 8, window.mMinY + 8, "ERROR: %s", msg);
+ 	directPrint(window.mMinX + 8, window.mMinY + 8 + 16, "ERROR: in %s at line %d", file, line);
+-	int y   = 36;
+-	int x   = 0;
+-	u32* sp = (u32*)OSGetStackPointer();
++	int y = 36;
++	int x = 0;
++	// PC: this walks the PPC linked-frame chain, where each frame's first word
++	// is the caller's frame pointer. uintptr_t rather than u32 so the walk
++	// itself is pointer-width-correct — but note it still cannot WORK here:
++	// OSGetStackPointer() is declared `u32` (Dolphin/OS/OSContext.h) and the
++	// shim truncates a 64-bit frame address into it, and findAddress() looks up
++	// PPC linker-map addresses that no host frame will match. UNUSED function;
++	// widening the shim is a separate job. See docs/ARCHITECTURE.md human list.
++	uintptr_t* sp = (uintptr_t*)(uintptr_t)OSGetStackPointer();
+ 	for (int i = 0; (void*)*sp != nullptr && *sp != 0xffffffff && i++ < 16;) {
+ 		if (i > 2) {
+-			const char* name = gsys->findAddress(sp[1]);
++			const char* name = gsys->findAddress((u32)sp[1]);
+ 			char buffer[PATH_MAX];
+ 			if (name)
+-				sprintf(buffer, "%08x", sp[1]);
++				sprintf(buffer, "%08x", (u32)sp[1]);
+ 			else
+ 				sprintf(buffer, "%s", name);
+ 			directPrint(window.mMinX + 8, window.mMinY + y, "<< %s", buffer);
+ 			y += 14;
+ 		}
+-		sp = (u32*)*sp;
++		sp = (uintptr_t*)*sp;
+ 	}
+ }
+ 
+diff --git a/src/sysDolphin/sysNew.cpp b/src/sysDolphin/sysNew.cpp
+index 3363c4a..83f335d 100644
+--- a/src/sysDolphin/sysNew.cpp
++++ b/src/sysDolphin/sysNew.cpp
+@@ -1,4 +1,5 @@
+ #include "sysNew.h"
++#include <stdio.h>
+ 
+ #include "DebugLog.h"
+ #include "MemStat.h"
+@@ -15,6 +16,29 @@ DEFINE_ERROR(4)
+  */
+ DEFINE_PRINT("sysNew");
+ 
++// PC: dump every heap's high-water mark. Registered with atexit() by the
++// PC_HEAPDIAG block in GameCoreSection::initStage, so it also fires at the END
++// of a session — the initStage report can only see what loading needed, and
++// 'teki' keeps growing all day as generators spawn. A play-through that only
++// measures load time would have missed exactly the kind of climb this exists
++// to catch. Guards gsys because atexit ordering is not ours to assume.
++extern "C" void pc_heap_report(void)
++{
++	// Self-gating so callers can invoke it unconditionally — the signal path in
++	// pc_uninit.cpp does exactly that.
++	if (!getenv("PC_HEAPDIAG") || !gsys) {
++		return;
++	}
++	for (int h = 0; h < SYSHEAP_COUNT; h++) {
++		AyuHeap* q = &gsys->mHeaps[h];
++		if (!q->mSize) {
++			continue;
++		}
++		fprintf(stderr, "[HEAP] %-8s peak %8d / %8d (%5.1f%%) at exit\n", q->mName ? q->mName : "?", q->getPeak(),
++		        q->mSize, 100.0 * q->getPeak() / q->mSize);
++	}
++}
++
+ /**
+  * @todo: Documentation
+  */
+@@ -32,7 +56,26 @@ void* System::alloc(size_t size)
+ 		}
+ 		result = heap->push(size);
+ 		if (!result) {
++			fprintf(stderr, "[PC] *** ALLOC FAIL %zu bytes in heap '%s' (size=%d used=%d)\n", size, heap->mName,
++			        heap->mSize, heap->mTotalSize); /* PC probe */
++			// PC: name every heap, not just the one that failed. Which heap ran
++			// out says almost nothing on its own — the useful question is whether
++			// one is pinned while the rest are idle (a sizing problem, as with
++			// day 5's 'teki') or they are all close to full (a real memory
++			// problem). Costs one line each, and only on the way to a crash.
++			for (int h = 0; h < SYSHEAP_COUNT; h++) {
++				AyuHeap* q = &gsys->mHeaps[h];
++				if (!q->mSize) continue;
++				fprintf(stderr, "[PC]     heap %-8s peak %8d   used %8d / %8d (%5.1f%%)\n", q->mName ? q->mName : "?",
++				        q->getPeak(), q->mTotalSize, q->mSize, q->mSize ? 100.0 * q->mTotalSize / q->mSize : 0.0);
++			}
+ 			ERROR("new[] %d failed in heap '%s'", size, heap->mName);
++			// PC: and do NOT fall through to the zeroing loop below, which
++			// memsets `size` bytes through this null and turns a clean, fully
++			// diagnosed allocation failure into a SIGSEGV at 0x0 inside
++			// System::alloc — several frames from the code that actually asked
++			// for the memory. That is how the day-5 crash presented.
++			return nullptr;
+ 		}
+ 
+ 		if (size == 0 || gsys->mForcePrint) {
+@@ -47,8 +90,8 @@ void* System::alloc(size_t size)
+ 			info = static_cast<MemInfo*>(info->mParent);
+ 		}
+ 
+-		if ((u32)result & 0x3) {
+-			ERROR("acquired memory not long aligned %08x!!\n", (u32)result);
++		if ((uintptr_t)result & 0x3) {
++			ERROR("acquired memory not long aligned %08x!!\n", PC_PTR_TO_U32(result));
+ 		}
+ 
+ 		u32* resPtr = (u32*)result;
+@@ -77,8 +120,8 @@ void* System::alloc(size_t size)
+  */
+ void* operator new(size_t size, int alignment)
+ {
+-	u32 alloc  = (u32)System::alloc(size + alignment);
+-	u32 result = (alloc + (alignment - 1)) & ~(alignment - 1);
++	uintptr_t alloc = (uintptr_t)System::alloc(size + alignment);
++	uintptr_t result = (alloc + (alignment - 1)) & ~(alignment - 1);
+ 	return (void*)result;
+ }
+ 
+@@ -87,8 +130,8 @@ void* operator new(size_t size, int alignment)
+  */
+ void* operator new[](size_t size, int alignment)
+ {
+-	u32 alloc  = (u32)System::alloc(size + alignment);
+-	u32 result = (alloc + (alignment - 1)) & ~(alignment - 1);
++	uintptr_t alloc = (uintptr_t)System::alloc(size + alignment);
++	uintptr_t result = (alloc + (alignment - 1)) & ~(alignment - 1);
+ 	return (void*)result;
+ }
+ 
+diff --git a/src/sysDolphin/system.cpp b/src/sysDolphin/system.cpp
+index eababec..5246d01 100644
+--- a/src/sysDolphin/system.cpp
++++ b/src/sysDolphin/system.cpp
+@@ -132,6 +132,7 @@ RandomAccessStream* System::openFile(immut char* path, bool isRelativePath, bool
+ 		FOREACH_NODE(DirEntry, mDvdRoot.mChild, node)
+ 		{
+ 			if (strcmp(node->mName, path) == 0) {
++				if (getenv("PC_VERBOSE")) fprintf(stderr, "[openFile] dvdRoot cache hit '%s' aram=%x pend=%d\n", path, node->mAddress, node->mPending); /* PC probe */
+ 				aramStream.init(path, node->mAddress, node->mPending);
+ 				return new BufferedInputStream(&aramStream, DVDStream::readBuffer, dvdStream.mSize);
+ 			}
+@@ -269,6 +270,39 @@ void System::updateSysClock()
+ 		mDeltaTime = 0.0f;
+ 	}
+ 
++#if defined(TARGET_PC)
++	// PC_FIXED_DT[=<seconds>]: pin the simulation timestep instead of deriving
++	// it from OSGetTick(). Everything frame-timed reads gsys->getFrameTime(),
++	// including the boot holds in ninLogo.cpp and newPikiGame.cpp, so this one
++	// value makes a scripted run advance by frame count rather than by how
++	// fast the machine happens to be.
++	//
++	// The -O0/-O2 A/B oracle (docs/ARCHITECTURE.md phase 4) cannot work without it.
++	// Its premise was "fixed-timestep scripted input", but there is no such
++	// mode: with a wall-clock delta the faster build is simply FURTHER ALONG
++	// at the same frame number, and that reads as a miscompile when it is
++	// nothing of the kind. Measured: the Nintendo logo at frame 60 differed
++	// between the -O0 and -O2 builds by 1.5% of pixels purely because the -O2
++	// build had advanced further into the logo's scale animation.
++	//
++	// Default 1/30 — the value the clamp above already yields at a locked
++	// 30 fps, so a paced run is unchanged. Dev tool; unset, nothing happens.
++	static f32 sFixedDt = -1.0f;
++	if (sFixedDt < 0.0f) {
++		const char* env = getenv("PC_FIXED_DT");
++		sFixedDt        = 0.0f;
++		if (env) {
++			sFixedDt = (f32)atof(env);
++			if (sFixedDt <= 0.0f) {
++				sFixedDt = 1.0f / 30.0f;
++			}
++		}
++	}
++	if (sFixedDt > 0.0f) {
++		mDeltaTime = sFixedDt;
++	}
++#endif
++
+ 	int time = tick - mFpsSampleStart;
+ 	if (time > OS_TIMER_CLOCK) {
+ 		mFPS                 = (f64)(OS_TIMER_CLOCK * (mEngineFrames - mFramesAtSampleStart)) / time;
+@@ -307,8 +341,8 @@ void System::parseArchiveDirectory(immut char* arcPath, immut char* dirPath)
+ 		list->mNextFreeAddress = addr;
+ 	}
+ 
+-	u32 unused;
+-	f32 unused2;
++	u32 unused = 0;  // PC: fakematch stack padding, never read for a value
++	f32 unused2 = 0.0f; // PC: ditto
+ 	STACK_PAD_VAR(1);
+ 
+ 	// this is necessary to get it to call the vtable ptr not just inline it.
+@@ -322,7 +356,7 @@ void System::parseArchiveDirectory(immut char* arcPath, immut char* dirPath)
+ 			size = stream.mSize;
+ 		}
+ 		((DVDStream*)&stream)->read(DVDStream::readBuffer, size);
+-		gsys->copyRamToCache((u32)DVDStream::readBuffer, size, a + pos);
++		gsys->copyRamToCache((uintptr_t)DVDStream::readBuffer, size, a + pos);
+ 		gsys->copyWaitUntilDone();
+ 		pos += size;
+ 		pend -= size;
+@@ -564,8 +598,21 @@ void System::hardReset()
+ 	}
+ 	mForcePrint = old;
+ 
++#ifdef TARGET_PC
++	/* PC: 0x96000 was the GC's tiny ARAM texture budget; eviction under that
++	   cap triggers a latent LP64 use-after-free in the LRU cacher (evicted
++	   CacheTexture keeps a dangling mActiveCache -> updateInfo reads freed,
++	   texture-data-filled memory as a list node and crashes making the HUD
++	   resident). We have abundant host RAM — give the pool enough headroom
++	   that a scene never evicts, sidestepping the eviction path. The real
++	   TexCacheInfo/CacheInfo LP64 layout fix is still owed. */
++	mCacher  = new TextureCacher(0x800000); // 8 MB (fits arena; ~13x the GC budget)
++#else
+ 	mCacher  = new TextureCacher(0x96000);
+-	int size = 0x20000;
++#endif
++	/* PC: 0x20000 was sized for GC struct sizes; LP64 objects are larger
++	   (pointers doubled). 4x headroom — the prior port slot-pool lesson. */
++	int size = 0x80000;
+ 	gsys->mHeaps[SYSHEAP_Lang].init("language", AYU_STACK_GROW_UP, alloc(size), size);
+ 	preloadLanguage();
+ 
+@@ -897,7 +944,7 @@ void System::Initialise()
+ 	void* hi   = OSGetArenaHi();
+ 	mHeapStart = OSRoundUp32B(OSInitAlloc(lo, hi, 1));
+ 	hi         = (void*)OSRoundDown32B(hi);
+-	mHeapEnd   = (u32)hi - mHeapStart;
++	mHeapEnd   = (uintptr_t)hi - mHeapStart;
+ #if defined(VERSION_GPIP01)
+ 	if (mHeapEnd <= 0x1800000)
+ #else
+@@ -988,7 +1035,7 @@ System::~System()
+  */
+ bool System::hasDebugInfo()
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(false);
+ }
+ 
+ /**
+@@ -1048,11 +1095,21 @@ void* loadFunc(void* idler)
+ 	while (true) {
+ 		OSMessage msg;
+ 		OSReceiveMessage(&loadMesgQueue, &msg, OS_MESSAGE_BLOCK);
+-		if ((u32)msg == 'QUIT') {
++		if ((u32)(uintptr_t)msg == 'QUIT') {
+ 			OSSendMessage(&sysMesgQueue, (OSMessage)'CONT', OS_MESSAGE_NOBLOCK);
+ 			break;
+ 		}
+ 
++#if defined(TARGET_PC)
++		// PC: the Metal present + SDL event pump only work from the main
++		// thread, so this thread's frames could never reach the screen (the
++		// loading banner simply didn't show). pc_loading_tick() — called from
++		// the DVD-read shim while the main thread is blocked loading — draws
++		// the loading screen there instead; this thread only keeps the
++		// QUIT/CONT handshake alive.
++		continue;
++#endif
++
+ 		if (gsys->mIsRendering) {
+ 			continue;
+ 		}
+@@ -1098,6 +1155,69 @@ void* loadFunc(void* idler)
+ 	return nullptr;
+ }
+ 
++#if defined(TARGET_PC)
++// The loading-screen frame, drawn on the MAIN thread. On GC the VI retrace
++// interrupt nudges loadFunc's thread and its GXCopyDisp reaches the screen;
++// on PC only the main thread can present, and during a load it is blocked in
++// synchronous file reads. The DVD-read shim calls this between reads: while
++// loading is active it renders the same frame loadFunc would have (dim quad +
++// idler banner) and pushes it through the PC present path. Throttled by VI
++// retrace count so long multi-read loads still pace at a sane rate.
++static LoadIdler* s_pc_load_idler;
++static bool s_pc_load_idler_inited;
++extern "C" u32 VIGetRetraceCount();
++extern "C" void pc_gx_frame_flush(void);
++extern "C" void pc_window_frame(void);
++extern "C" int pc_is_main_thread(void);
++extern "C" void pc_loading_tick(void)
++{
++	// DVDReadPrio calls this, and once audio is live the main thread is no
++	// longer the only reader: jaudio's jac_dvdproc thread loads banks through
++	// the same shim. Presenting from there pumps Cocoa off-thread (AppKit
++	// throws) and would race the renderer's GX state besides. Loading frames
++	// are a main-thread affair; other threads just read their file.
++	if (!pc_is_main_thread()) {
++		return;
++	}
++	if (!gsys || !gsys->mIsLoadingActive || gsys->mIsRendering) {
++		return;
++	}
++	static u32 lastTick;
++	static u32 ticks;
++	u32 now = VIGetRetraceCount();
++	if (now - lastTick < 4) { // ~15 Hz is plenty for a loading screen
++		return;
++	}
++	lastTick = now;
++	ticks++;
++
++	if (s_pc_load_idler && !s_pc_load_idler_inited) {
++		s_pc_load_idler->init();
++		s_pc_load_idler_inited = true;
++	}
++
++	gsys->beginRender();
++	Matrix4f mtx;
++	DGXGraphics* gfx = static_cast<DGXGraphics*>(gsys->mDGXGfx);
++	gfx->setOrthogonal(mtx.mMtx, RectArea(0, 0, gfx->mScreenWidth, gfx->mScreenHeight));
++	if (gsys->mIsLoadScreenActive) {
++		gfx->setColour(Colour(0, 0, 0, 32), true);
++		gfx->setAuxColour(Colour(0, 0, 0, 32));
++		gfx->fillRectangle(RectArea(0, 0, gfx->mScreenWidth, gfx->mScreenHeight));
++	}
++	// mLoadTimeBeforeIdling is authored in GC loadFunc frames (~1 per 60 Hz
++	// retrace); our ticks run every 4 retraces. Unscaled, the standard
++	// 60-frame banner delay became ~4 s of ticks — longer than a fast SSD
++	// load — so the course title card never drew.
++	if (s_pc_load_idler && ticks * 4 >= gsys->mLoadTimeBeforeIdling) {
++		s_pc_load_idler->draw(*gfx);
++	}
++	static_cast<DGXGraphics*>(gsys->mDGXGfx)->doneRender();
++	pc_gx_frame_flush();
++	pc_window_frame();
++}
++#endif
++
+ OSThread Thread;
+ u8 ThreadStack[0x2000] ATTRIBUTE_ALIGN(32);
+ OSThread dvdThread;
+@@ -1116,6 +1236,10 @@ void System::startLoading(LoadIdler* idler, bool useLoadScreen, u32 loadDelay)
+ 	if (mIsLoadingActive == 0) {
+ 		mLoadTimeBeforeIdling = loadDelay;
+ 		mIsLoadScreenActive   = useLoadScreen;
++#if defined(TARGET_PC)
++		s_pc_load_idler        = idler;
++		s_pc_load_idler_inited = false;
++#endif
+ #if defined(VERSION_PIKIDEMO) || defined(VERSION_GPIJ01)
+ 		// demo removes the loading thread after it's finished, while other versions maintain it.
+ 		OSCreateThread(&Thread, loadFunc, idler, ThreadStack + sizeof(ThreadStack), sizeof(ThreadStack), 15, OS_THREAD_ATTR_DETACH);
+@@ -1152,6 +1276,10 @@ void System::endLoading()
+ 		GXSetCurrentGXThread();
+ 		mIsLoadingActive    = 0;
+ 		mIsLoadScreenActive = 0;
++#if defined(TARGET_PC)
++		s_pc_load_idler        = nullptr;
++		s_pc_load_idler_inited = false;
++#endif
+ 	}
+ }
+ 
+@@ -1160,7 +1288,7 @@ void System::endLoading()
+  *
+  * @param cache Pointer to system cache entry assigned to the DMA operation (aliased as a u32).
+  */
+-void doneDMA(u32 cache)
++void doneDMA(uintptr_t cache)
+ {
+ 	// free the cache
+ 	SystemCache* sysCache = (SystemCache*)((SystemCache*)cache)->owner;
+@@ -1187,7 +1315,7 @@ void System::copyWaitUntilDone()
+  * @param aramCacheAddr Address to copy data to in ARAM - if 0, it will attempt to allocate the next free ARAM address.
+  * @return Address that data has been copied to in ARAM.
+  */
+-u32 System::copyRamToCache(u32 mainMemAddr, u32 size, u32 aramCacheAddr)
++u32 System::copyRamToCache(uintptr_t mainMemAddr, u32 size, u32 aramCacheAddr)
+ {
+ 	// wait until any active DMA requests are done
+ 	copyWaitUntilDone();
+@@ -1221,7 +1349,7 @@ u32 System::copyRamToCache(u32 mainMemAddr, u32 size, u32 aramCacheAddr)
+ 	DCStoreRange((void*)mainMemAddr, size);
+ 
+ 	// send request to the aram queue (high priority)
+-	ARQPostRequest(cache, (u32)cache, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_HIGH, mainMemAddr, adjustedCacheAddr, size, doneDMA);
++	ARQPostRequest(cache, (uintptr_t)cache, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_HIGH, mainMemAddr, adjustedCacheAddr, size, doneDMA);
+ 
+ 	return adjustedCacheAddr;
+ 
+@@ -1235,7 +1363,7 @@ u32 System::copyRamToCache(u32 mainMemAddr, u32 size, u32 aramCacheAddr)
+  * @param aramCacheAddr Address to copy data from in ARAM.
+  * @param size Size of data to copy (bytes).
+  */
+-void System::copyCacheToRam(u32 mainMemAddr, u32 aramCacheAddr, u32 size)
++void System::copyCacheToRam(uintptr_t mainMemAddr, u32 aramCacheAddr, u32 size)
+ {
+ 	// wait until any active DMA requests are done
+ 	copyWaitUntilDone();
+@@ -1258,7 +1386,7 @@ void System::copyCacheToRam(u32 mainMemAddr, u32 aramCacheAddr, u32 size)
+ 	DCInvalidateRange((void*)mainMemAddr, size);
+ 
+ 	// send request to the aram queue (high priority)
+-	ARQPostRequest(cache, (u32)cache, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_HIGH, aramCacheAddr, mainMemAddr, size, doneDMA);
++	ARQPostRequest(cache, (uintptr_t)cache, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_HIGH, aramCacheAddr, mainMemAddr, size, doneDMA);
+ }
+ 
+ /**
+@@ -1266,7 +1394,7 @@ void System::copyCacheToRam(u32 mainMemAddr, u32 aramCacheAddr, u32 size)
+  *
+  * @param cache Pointer to system cache entry assigned to the texture copy operation (aliased as a u32).
+  */
+-void freeBuffer(u32 cache)
++void freeBuffer(uintptr_t cache)
+ {
+ 	CacheTexture* texCache = (CacheTexture*)(((SystemCache*)cache)->owner);
+ 
+@@ -1311,7 +1439,7 @@ void System::copyCacheToTexture(CacheTexture* tex)
+ 
+ 	tex->mSystemCache = cache;
+ 
+-	u32 mainMemAddr = (u32)tex->mTexImage->mTextureData;
++	uintptr_t mainMemAddr = (uintptr_t)tex->mTexImage->mTextureData;
+ 	u32 aramAddr    = tex->mAramAddress;
+ 	u32 size        = tex->mTexImage->mDataSize;
+ 
+@@ -1319,7 +1447,7 @@ void System::copyCacheToTexture(CacheTexture* tex)
+ 
+ 	gsys->mTexComplete = FALSE;
+ 	DCInvalidateRange((void*)mainMemAddr, size);
+-	ARQPostRequest(cache, (u32)tex, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_HIGH, aramAddr, (u32)mainMemAddr, size, freeBuffer);
++	ARQPostRequest(cache, (uintptr_t)tex, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_HIGH, aramAddr, mainMemAddr, size, freeBuffer);
+ 
+ 	while (mTexComplete == FALSE) { }
+ }

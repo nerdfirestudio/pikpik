@@ -1,0 +1,4229 @@
+diff --git a/src/hvqm4dec/hvqm4dec.c b/src/hvqm4dec/hvqm4dec.c
+index 76930dd..3a18831 100644
+--- a/src/hvqm4dec/hvqm4dec.c
++++ b/src/hvqm4dec/hvqm4dec.c
+@@ -25,9 +25,27 @@ static u32 readTree_scale;
+ #define LUMA_IDX   0
+ #define CHROMA_IDX 1
+ 
+-#define read8(buf, offset)  (*(u8*)((u8*)(buf) + (offset)))
++#define read8(buf, offset) (*(u8*)((u8*)(buf) + (offset)))
++#if defined(TARGET_PC)
++// PC: every one of these reads compressed .h4m stream data, which is
++// big-endian — the offsets in a frame's code block, and the nest dimensions.
++// There are no host-native uses of read16/read32 in this file (checked all 35
++// call sites), so swapping here is both correct and complete. Read natively,
++// the very first one hands setCode a size of 0x0B000000 instead of 11 and the
++// decoder walks off the buffer immediately.
++#define read16(buf, offset) __builtin_bswap16(*(u16*)((u8*)(buf) + (offset)))
++#define read32(buf, offset) __builtin_bswap32(*(u32*)((u8*)(buf) + (offset)))
++// The bitstream itself is consumed MSB-first out of 32-bit words (see getBit /
++// getByte). On big-endian hardware a plain load puts the stream's first byte in
++// the most significant position, which is where the bit walk starts; on a
++// little-endian host it lands in the least significant byte and the bit order
++// inverts. Swap at the load so the rest of the bit reader is unchanged.
++#define PC_STREAM_WORD(p) __builtin_bswap32(*(u32*)(p))
++#else
+ #define read16(buf, offset) (*(u16*)((u8*)(buf) + (offset)))
+ #define read32(buf, offset) (*(u32*)((u8*)(buf) + (offset)))
++#define PC_STREAM_WORD(p)   (*(u32*)(p))
++#endif
+ 
+ static inline u8 saturate(int x)
+ {
+@@ -135,7 +153,10 @@ static inline int getBit(BitBuffer* str)
+ 	int bit;
+ 
+ 	if ((bit = str->shift) < 0) {
+-		value = str->word = *((u32*)str->ptr)++;
++		/* PC: MWCC lvalue-cast `*((u32*)str->ptr)++` rewritten. The M6 byte-order
++		   audit this used to flag is done — see PC_STREAM_WORD above. */
++		value = str->word = PC_STREAM_WORD(str->ptr);
++		str->ptr += sizeof(u32);
+ 		bit               = 31;
+ 	} else {
+ 		value = str->word;
+@@ -160,7 +181,8 @@ static inline s16 getByte(BitBuffer* str)
+ 	} else {
+ 		value = str->word;
+ 		value <<= 7 - bit;
+-		str->word = *((u32*)str->ptr)++;
++		str->word = PC_STREAM_WORD(str->ptr); /* PC: lvalue-cast rewritten */
++		str->ptr += sizeof(u32);
+ 		value |= str->word >> (bit + 25);
+ 		bit += 24;
+ 	}
+@@ -1003,7 +1025,7 @@ static inline s32 GetMCAotBasis(VideoState* ws, u8 basisOut[16], s32* pscl, u8*
+ 
+ static inline s32 GetAotSum(VideoState* ws, long sum[16], u8 nbasis, u8* nestTop, int nestWidth, int p)
+ {
+-	long prev_scl;
++	s32 prev_scl; /* PC: was `long` — must match GetAotBasis's s32* on LP64 */
+ 	long scl;
+ 	u8 bas[16];
+ 
+@@ -2214,7 +2236,7 @@ void HVQM4DecodeIpic(SeqObj* obj, void* code, void* outbuf)
+ 	MakeNest(ws, read16(code, 4), read16(code, 6));
+ 
+ 	for (i = 0; i < HVQM_PLANE_COUNT; i++) {
+-		IpicPlaneDec(ws, i, outbuf);
++		IpicPlaneDec(ws, i, (u8*)outbuf);
+ 		outbuf = (u8*)outbuf + ws->pln[i].plane_size;
+ 	}
+ }
+@@ -2274,5 +2296,5 @@ void HVQM4DecodeBpic(SeqObj* obj, void* code, void* outbuf, void* ref2, void* re
+ 	ws->dc_max = +0x7F << read8(code, 0);
+ 	ws->dc_min = -0x80 << read8(code, 0);
+ 
+-	BpicPlaneDec(obj, outbuf, ref2, ref1);
++	BpicPlaneDec(obj, (u8*)outbuf, (u8*)ref2, (u8*)ref1);
+ }
+diff --git a/src/jaudio/aictrl.c b/src/jaudio/aictrl.c
+index 3067bd6..0569ad1 100644
+--- a/src/jaudio/aictrl.c
++++ b/src/jaudio/aictrl.c
+@@ -72,6 +72,10 @@ void* OSAlloc2(u32 size)
+ 		alloc = Nas_HeapAlloc(&audio_hp, size);
+ 		break;
+ 	}
++	// Census -Wconditional-uninitialized (`alloc`): AUDITED NON-BUG.
++	// `audio_hp_exist` is file-static, initialised FALSE, and its only two
++	// writes (both in Nas_HeapInit above) are the literals TRUE and FALSE. The
++	// domain is {0,1} and both are cases, so the fall-through is unreachable.
+ 	}
+ 
+ 	OSRestoreInterrupts(enabled);
+@@ -102,7 +106,7 @@ void Jac_Init()
+ 	}
+ 
+ 	AIInit(NULL);
+-	AIInitDMA((u32)dac[2], DAC_SIZE * 2);
++	AIInitDMA((uintptr_t)dac[2], DAC_SIZE * 2);
+ 	STACK_PAD_VAR(4);
+ }
+ 
+@@ -399,7 +403,7 @@ void Jac_UpdateDAC()
+ 	}
+ 
+ 	if (use_rsp_madep != NULL) {
+-		AIInitDMA((u32)use_rsp_madep, DAC_SIZE * 2);
++		AIInitDMA((uintptr_t)use_rsp_madep, DAC_SIZE * 2);
+ 		use_rsp_madep = NULL;
+ 	} else {
+ 		UNIVERSAL_DACCOUNTER++;
+diff --git a/src/jaudio/aramcall.c b/src/jaudio/aramcall.c
+index 4a62751..799176c 100644
+--- a/src/jaudio/aramcall.c
++++ b/src/jaudio/aramcall.c
+@@ -82,6 +82,11 @@ void Show_AramMotherHeap(void)
+  */
+ void Collect_AramMotherHeap(void)
+ {
++#if defined(TARGET_PC)
++	// Compaction MOVES loaded archives; an in-flight DVD->ARAM load would
++	// land at its pre-move destination. Same barrier as Jac_SceneClose.
++	pc_dvdt_drain();
++#endif
+ 	Jac_GarbageCollection_St(&aram_mother);
+ 	Show_AramMotherHeap();
+ }
+@@ -99,7 +104,7 @@ void Init_AramMotherHeap(void)
+ 		inited = TRUE;
+ 
+ 		void* alloc = ARAllocFull(&outSize);
+-		Jac_InitMotherHeap(&aram_mother, (u32)alloc, outSize, 0);
++		Jac_InitMotherHeap(&aram_mother, PC_PTR_TO_U32(alloc), outSize, 0);
+ 	}
+ }
+ 
+diff --git a/src/jaudio/audiothread.c b/src/jaudio/audiothread.c
+index 3c55f32..d2af6c6 100644
+--- a/src/jaudio/audiothread.c
++++ b/src/jaudio/audiothread.c
+@@ -38,6 +38,10 @@ static OSMessage msgbuf[AUDIOPROC_MQ_BUF_COUNT];
+ 
+ static u32 audioproc_mq_init;
+ static volatile int intcount;
++#if defined(TARGET_PC)
++// Set once audioproc's init is complete; see the note by the assignment.
++volatile u32 g_pc_jac_audio_ready;
++#endif
+ 
+ /**
+  * @TODO: Documentation
+@@ -203,20 +207,37 @@ static void* audioproc(void*)
+ 	AIRegisterDMACallback(&AudioSync);
+ 	AIStartDMA();
+ 
++#if defined(TARGET_PC)
++	// PC: everything above is this thread's one-time init, and part of it —
++	// ResetPlayerCallback() — WIPES state the main thread registers into
++	// (Jac_PlayInit's Jaq_StartSeq installs the sequencer's DSP player
++	// callbacks). On GC the ordering worked out; two host threads just race,
++	// and losing it is silent and fatal: the sequencer is never driven, no
++	// track ever registers, and Jac_InitEventSystem spins on
++	// Jam_GetTrackHandle(0x20000) forever. Jac_Start waits on this.
++	g_pc_jac_audio_ready = 1;
++#endif
++
+ 	while (TRUE) {
+ 		OSMessage msg;
+ 
+ 		OSReceiveMessage(&audioproc_mq, &msg, OS_MESSAGE_BLOCK);
+-		switch ((int)msg) {
+-		case (int)AUDIOPROC_MESSAGE_UPDATE_DAC:
++		switch ((int)(intptr_t)msg) {
++		case (int)(intptr_t)AUDIOPROC_MESSAGE_UPDATE_DAC:
+ 		{
+ 			Jac_UpdateDAC();
+ 			break;
+ 		}
+-		case (int)AUDIOPROC_MESSAGE_DSP_SYNC:
++		case (int)(intptr_t)AUDIOPROC_MESSAGE_DSP_SYNC:
+ 		{
+ 			if (intcount == 0) {
+-				return;
++#if defined(TARGET_PC)
++				// A DSP sync with no frame outstanding ends the audio thread —
++				// silently, on GC. Say so: everything downstream (DAC updates,
++				// the whole frame pipeline) stops here.
++				OSReport("[JAUDIO] audioproc EXITING: DSP_SYNC with intcount == 0\n");
++#endif
++				return nullptr; /* PC: audioproc returns void* */
+ 			}
+ 
+ 			intcount--;
+@@ -231,12 +252,12 @@ static void* audioproc(void*)
+ 
+ 			break;
+ 		}
+-		case (int)AUDIOPROC_MESSAGE_NEOS_SYNC:
++		case (int)(intptr_t)AUDIOPROC_MESSAGE_NEOS_SYNC:
+ 		{
+ 			CpuFrameEnd();
+ 			break;
+ 		}
+-		case (int)AUDIOPROC_MESSAGE_3:
++		case (int)(intptr_t)AUDIOPROC_MESSAGE_3:
+ 		{
+ 			OSExitThread(NULL);
+ 			break;
+diff --git a/src/jaudio/bankdrv.c b/src/jaudio/bankdrv.c
+index 0450f60..46fc200 100644
+--- a/src/jaudio/bankdrv.c
++++ b/src/jaudio/bankdrv.c
+@@ -1,5 +1,7 @@
+ #include "jaudio/bankdrv.h"
+ 
++#include "Dolphin/os.h"
++#include <stdlib.h>
+ #include "jaudio/bx.h"
+ #include "jaudio/ja_calc.h"
+ #include "jaudio/random.h"
+@@ -75,7 +77,7 @@ int Bank_GetInstKeymap(Inst_* inst, u8 param_2)
+ /**
+  * @TODO: Documentation
+  */
+-int Bank_GetInstVmap(Inst_* inst, u8 param_2, u8 param_3)
++intptr_t Bank_GetInstVmap(Inst_* inst, u8 param_2, u8 param_3)
+ {
+ 	STACK_PAD_VAR(1);
+ 
+@@ -90,7 +92,7 @@ int Bank_GetInstVmap(Inst_* inst, u8 param_2, u8 param_3)
+ 		for (u32 i = 0; i < key->mVelocityCount; i++) {
+ 			Vmap_* vmap = key->mVelocities[i];
+ 			if (param_3 <= vmap->mBaseVelocity) {
+-				return (int)vmap;
++				return (intptr_t)vmap;
+ 			}
+ 		}
+ 
+@@ -128,7 +130,7 @@ Vmap_* Bank_GetPercVmap(Perc_* perc, u8 keyIdx, u8 vel)
+  */
+ int Bank_GetVoiceMap(Voice_* voice, u16 id)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+@@ -173,6 +175,26 @@ f32 Bank_RandToOfs(Rand_* rand)
+ /**
+  * @TODO: Documentation
+  */
++
++#if defined(TARGET_PC)
++// PC: envelope vectors reached through Osc_::attackVecOffset/releaseVecOffset
++// are s16 arrays living INSIDE the .bx image, i.e. big-endian file data — but
++// the same code also walks host-authored tables from the DOL (jamosc.c's
++// VIB_TABLE, oneshot.c's OSC_REL, FORCE_RELEASE_TABLE), which are native.
++// Swap only when the address is inside the loaded image.
++//
++// Measured: an envelope step of 0x0F00 (3840, i.e. 0.117 of full scale) read
++// natively comes back as 0x000F = 15, so targetValue advanced 15/32768 =
++// 0.000457 per step. The envelope crawled and every note was inaudible.
++static inline s16 pc_env_read(const s16* table, int i)
++{
++	return jau_bx_contains(&table[i]) ? (s16)__builtin_bswap16((u16)table[i]) : table[i];
++}
++#define ENV_READ(t, i) pc_env_read((t), (i))
++#else
++#define ENV_READ(t, i) ((t)[(i)])
++#endif
++
+ f32 Bank_OscToOfs(Osc_* osc, Oscbuf_* buf)
+ {
+ 	f32 sub;
+@@ -259,9 +281,9 @@ f32 Bank_OscToOfs(Osc_* osc, Oscbuf_* buf)
+ 			buf->state = 0;
+ 			break;
+ 		}
+-		val0 = table[offset + 0];
+-		val1 = table[offset + 1];
+-		val2 = table[offset + 2];
++		val0 = ENV_READ(table, offset + 0);
++		val1 = ENV_READ(table, offset + 1);
++		val2 = ENV_READ(table, offset + 2);
+ 
+ 		if (val0 == 0xd) {
+ 			buf->tableIndex = val2;
+diff --git a/src/jaudio/bankloader.c b/src/jaudio/bankloader.c
+index 4bd616e..5523937 100644
+--- a/src/jaudio/bankloader.c
++++ b/src/jaudio/bankloader.c
+@@ -2,6 +2,7 @@
+ 
+ #include "jaudio/aictrl.h"
+ #include "jaudio/bankread.h"
++#include "jaudio/bx_pc.h"
+ #include "jaudio/dvdthread.h"
+ #include "jaudio/waveread.h"
+ 
+@@ -44,10 +45,41 @@ void Bank_Setup(immut char* filename)
+ 
+ 	Bank_Init();
+ 
+-	mem = (u8*)OSAlloc2(DVDT_CheckFile(filename));
++	u32 fileSize = DVDT_CheckFile(filename);
++	mem          = (u8*)OSAlloc2(fileSize);
+ 	DVDT_LoadFile(filename, mem);
+ 	header = (BXHeader*)mem;
+ 
++#if defined(TARGET_PC)
++	// Every record the parsers touch lives inside this one allocation, so the
++	// 4-byte pointer slots can address any of them as an offset from here.
++	jau_bx_begin(mem, fileSize);
++#endif
++
++#if defined(TARGET_PC)
++	// PC: the .bx is a big-endian disc file overlaid straight onto BXHeader /
++	// AddrSize. Unswapped, wsysPointerOffset 0x10 reads as 0x10000000 and the
++	// first `mem + pairs[i].addr` walks off into nowhere. Normalise the header
++	// and both pointer tables in place, then the loop below is unmodified.
++	// (The WSYS/IBNK blobs the pairs point AT are byte-swapped by their own
++	// readers — see waveread.c / bankread.c.)
++	header->wsysPointerOffset = __builtin_bswap32(header->wsysPointerOffset);
++	header->wsysPointerCount  = __builtin_bswap32(header->wsysPointerCount);
++	header->ibnkPointerOffset = __builtin_bswap32(header->ibnkPointerOffset);
++	header->ibnkPointerCount  = __builtin_bswap32(header->ibnkPointerCount);
++
++	pairs = (AddrSize*)(mem + header->wsysPointerOffset);
++	for (i = 0; i < header->wsysPointerCount; ++i) {
++		pairs[i].addr = __builtin_bswap32(pairs[i].addr);
++		pairs[i].size = __builtin_bswap32(pairs[i].size);
++	}
++	pairs = (AddrSize*)(mem + header->ibnkPointerOffset);
++	for (i = 0; i < header->ibnkPointerCount; ++i) {
++		pairs[i].addr = __builtin_bswap32(pairs[i].addr);
++		pairs[i].size = __builtin_bswap32(pairs[i].size);
++	}
++#endif
++
+ 	Wavegroup_Init();
+ 
+ 	pointerCount = header->wsysPointerCount;
+@@ -67,4 +99,8 @@ void Bank_Setup(immut char* filename)
+ 			Bank_Regist((void*)(mem + pairs[i].addr), i);
+ 		}
+ 	}
++
++#if defined(TARGET_PC)
++	jau_bx_report();
++#endif
+ }
+diff --git a/src/jaudio/bankread.c b/src/jaudio/bankread.c
+index eb1aa7f..f3f0223 100644
+--- a/src/jaudio/bankread.c
++++ b/src/jaudio/bankread.c
+@@ -10,6 +10,12 @@ static Bank_* bankp[BANKP_SIZE];
+ /**
+  * @TODO: Documentation
+  */
++#if defined(TARGET_PC)
++// PC: see waveread.c / bx_pc.h — file pointer slots are 4 bytes and relocate
++// to offsets from the .bx image base.
++template <typename T> static void PTconvert(JauFilePtr<T>* slot, uintptr_t base_address) { PTconvertT(slot, base_address); }
++static void PTconvert(JauVecPtr* slot, uintptr_t base_address) { PTconvertT(slot, base_address); }
++#else
+ static void PTconvert(void** pointer, u32 base_address)
+ {
+ 	if (*pointer >= (void*)base_address || *pointer == NULL) {
+@@ -17,6 +23,7 @@ static void PTconvert(void** pointer, u32 base_address)
+ 	}
+ 	*pointer = *(char**)pointer + base_address;
+ }
++#endif
+ 
+ /**
+  * @TODO: Documentation
+@@ -24,14 +31,14 @@ static void PTconvert(void** pointer, u32 base_address)
+ Bank_* Bank_Test(u8* ibnk_address)
+ {
+ 	u32 i, k, j;
+-	u32 base_addr    = (u32)ibnk_address;
++	uintptr_t base_addr = (uintptr_t)ibnk_address;
+ 	Bank_* startBank = (Bank_*)(ibnk_address + 0x20);
+ 	if (startBank->mMagic != 'BANK') {
+ 		return NULL;
+ 	}
+ 
+ 	for (i = 0; i < BANK_TEST_INST_COUNT; ++i) {
+-		PTconvert((void**)&startBank->mInstruments[i], base_addr);
++		PTconvert(&startBank->mInstruments[i], base_addr);
+ 
+ 		Inst_* inst = startBank->mInstruments[i];
+ 		if (!inst) {
+@@ -40,29 +47,29 @@ Bank_* Bank_Test(u8* ibnk_address)
+ 
+ 		// each instrument has two oscillators, effects, and sensors
+ 		for (j = 0; j < 2; j++) {
+-			PTconvert((void**)&inst->mOscillators[j], base_addr);
+-			PTconvert((void**)&inst->mEffects[j], base_addr);
+-			PTconvert((void**)&inst->mSensors[j], base_addr);
++			PTconvert(&inst->mOscillators[j], base_addr);
++			PTconvert(&inst->mEffects[j], base_addr);
++			PTconvert(&inst->mSensors[j], base_addr);
+ 
+ 			if (inst->mOscillators[j]) {
+-				PTconvert((void**)&inst->mOscillators[j]->attackVecOffset, base_addr);
+-				PTconvert((void**)&inst->mOscillators[j]->releaseVecOffset, base_addr);
++				PTconvert(&inst->mOscillators[j]->attackVecOffset, base_addr);
++				PTconvert(&inst->mOscillators[j]->releaseVecOffset, base_addr);
+ 			}
+ 		}
+ 
+ 		// each instrument also has a certain number of key regions
+ 		for (j = 0; j < inst->mKeyRegionCount; j++) {
+-			PTconvert((void**)&inst->mKeyRegions[j], base_addr);
++			PTconvert(&inst->mKeyRegions[j], base_addr);
+ 
+ 			for (k = 0; k < inst->mKeyRegions[j]->mVelocityCount; k++) {
+-				PTconvert((void**)&inst->mKeyRegions[j]->mVelocities[k], base_addr);
++				PTconvert(&inst->mKeyRegions[j]->mVelocities[k], base_addr);
+ 			}
+ 		}
+ 	}
+ 
+ 	// treat the next block of 100 as voices (for some reason)
+ 	for (i = 0; i < BANK_TEST_VOICE_COUNT; i++) {
+-		PTconvert((void**)&(startBank->mVoices + BANK_TEST_VOICE_OFFSET)[i], base_addr);
++		PTconvert(&(startBank->mVoices + BANK_TEST_VOICE_OFFSET)[i], base_addr);
+ 
+ 		Voice_* voice = (startBank->mVoices + BANK_TEST_VOICE_OFFSET)[i];
+ 		if (!voice) {
+@@ -70,13 +77,13 @@ Bank_* Bank_Test(u8* ibnk_address)
+ 		}
+ 
+ 		for (j = 0; j < voice->size; j++) {
+-			PTconvert((void**)&voice->_0C[j], base_addr);
++			PTconvert(&voice->_0C[j], base_addr);
+ 		}
+ 	}
+ 
+ 	// treat the next block of 12 as percussion (for some reason)
+ 	for (i = 0; i < BANK_TEST_PERC_COUNT; i++) {
+-		PTconvert((void**)&(startBank->mPercs + BANK_TEST_PERC_OFFSET)[i], base_addr);
++		PTconvert(&(startBank->mPercs + BANK_TEST_PERC_OFFSET)[i], base_addr);
+ 
+ 		Perc_* perc = (startBank->mPercs + BANK_TEST_PERC_OFFSET)[i];
+ 		if (!perc) {
+@@ -84,18 +91,18 @@ Bank_* Bank_Test(u8* ibnk_address)
+ 		}
+ 
+ 		for (j = 0; j < 128; j++) {
+-			PTconvert((void**)&perc->mKeyRegions[j], base_addr);
++			PTconvert(&perc->mKeyRegions[j], base_addr);
+ 
+ 			PercKeymap_* key = perc->mKeyRegions[j];
+ 			if (!key) {
+ 				continue;
+ 			}
+ 
+-			PTconvert((void**)&key->_08, base_addr);
+-			PTconvert((void**)&key->_0C, base_addr);
++			PTconvert(&key->_08, base_addr);
++			PTconvert(&key->_0C, base_addr);
+ 
+ 			for (k = 0; k < key->mVelocityCount; k++) {
+-				PTconvert((void**)&key->mVelocities[k], base_addr);
++				PTconvert(&key->mVelocities[k], base_addr);
+ 			}
+ 		}
+ 	}
+diff --git a/src/jaudio/cmdqueue.c b/src/jaudio/cmdqueue.c
+index 98f7947..f5bd4aa 100644
+--- a/src/jaudio/cmdqueue.c
++++ b/src/jaudio/cmdqueue.c
+@@ -4,6 +4,7 @@
+ #include "jaudio/jammain_2.h"
+ #include "jaudio/playercall.h"
+ #include "jaudio/verysimple.h"
++#include "pc_uninit.h"
+ #include <stddef.h>
+ 
+ /**
+@@ -46,7 +47,11 @@ void Jal_AddCmdQueue(CmdQueue* cmdQueue, seqp_* track, u8 param_3)
+ 	restoreInterrupts = OSDisableInterrupts();
+ 	cmdQueue->track   = track;
+ 	cmdQueue->_64     = param_3;
++#if defined(TARGET_PC)
++	Jac_InitMessageQueue(&cmdQueue->msgQueue, cmdQueue->message, 16);
++#else
+ 	Jac_InitMessageQueue(&cmdQueue->msgQueue, &cmdQueue->message, 16);
++#endif
+ 	Add_Queue(cmdQueue);
+ 	OSRestoreInterrupts(restoreInterrupts);
+ }
+@@ -64,22 +69,33 @@ void Jal_RemoveCmdQueue(void)
+  * @TODO: Documentation
+  * @note UNUSED Size: 000024
+  */
++// PC: every send here puts a u16 command code INTO the OSMessage (void*) slot
++// and every receive takes it straight back out as a u16 — the queue is a
++// transport for a small integer, not for a pointer. Nothing is truncated and
++// nothing is dereferenced; PC_INT_AS_PTR says so at each site.
+ void Jal_SendCmdQueue(CmdQueue* queue, u16 msg)
+ {
+-	Jac_SendMessageBlock(&queue->msgQueue, (OSMessage)msg);
++	Jac_SendMessageBlock(&queue->msgQueue, PC_INT_AS_PTR(OSMessage, msg));
+ }
+ 
+ /**
+  * @TODO: Documentation
+  */
++#if defined(TARGET_PC)
++u32 g_pc_cmdq_sent, g_pc_cmdq_delivered, g_pc_cmdq_blocked;
++#endif
++
+ void Jal_SendCmdQueue_Noblock(CmdQueue* queue, u16 msg)
+ {
++#if defined(TARGET_PC)
++	g_pc_cmdq_sent++;
++#endif
+ 	CmdQueue** REF_queue;
+ 	u16* REF_msg;
+ 
+ 	REF_queue = &queue;
+ 	REF_msg   = &msg;
+-	Jac_SendMessage(&queue->msgQueue, (OSMessage)msg);
++	Jac_SendMessage(&queue->msgQueue, PC_INT_AS_PTR(OSMessage, msg));
+ 
+ #if defined(VERSION_GPIJ01_01)
+ 	int padding;
+@@ -92,9 +108,9 @@ void Jal_SendCmdQueue_Noblock(CmdQueue* queue, u16 msg)
+ void Jal_SendCmdQueue_Force(CmdQueue* queue, u16 msg)
+ {
+ 	OSMessage outMsg;
+-	if (!Jac_SendMessage(&queue->msgQueue, (OSMessage)msg)) {
++	if (!Jac_SendMessage(&queue->msgQueue, PC_INT_AS_PTR(OSMessage, msg))) {
+ 		Jac_ReceiveMessage(&queue->msgQueue, &outMsg);
+-		Jac_SendMessage(&queue->msgQueue, (OSMessage)msg);
++		Jac_SendMessage(&queue->msgQueue, PC_INT_AS_PTR(OSMessage, msg));
+ 	}
+ }
+ 
+@@ -105,9 +121,39 @@ static s32 Jal_FrameWork(void* a)
+ {
+ 	CmdQueue* curr;
+ 	OSMessage message;
+-	s32 result;
++	// PC: 0, not indeterminate. This function is a registered player callback and
++	// PlayerCallback() (playercall.c:97) treats a -1 return as "unregister me",
++	// so the value here decides whether the sequencer command queue keeps being
++	// serviced at all. `result` is assigned only when some queue both passed its
++	// port check AND had a message waiting; PC_UNINIT_PROBE measured 36214 frames
++	// in 90 s where neither happened and this was read unassigned.
++	//
++	// -ftrivial-auto-var-init=zero already makes those reads 0, so this changes
++	// no behavior — it stops "the audio command queue stays registered" from
++	// depending on a compiler flag. The in-source note below spotted the UB
++	// ("I think they accidentally wrote UB or something") without spotting that
++	// the return value is load-bearing.
++	s32 result = 0;
++#if defined(TARGET_PC)
++	// Census -Wconditional-uninitialized (`result`): probe scaffolding. `result`
++	// is assigned only when some queue both passed its port check AND had a
++	// message waiting, so a tick where nothing was delivered returns the zero
++	// -ftrivial-auto-var-init leaves. The in-source note below already calls
++	// this UB; this measures whether the game reaches it.
++	int pc_result_set = 0;
++#endif
+ 
+ 	for (curr = queue_list; curr; curr = curr->next) {
++#if defined(TARGET_PC)
++		// A queue entry whose track has gone away has nothing to check. The
++		// retail code never guards this because on hardware the event tracks
++		// outlive the queue; here a track can be released first and the port
++		// check then dereferences NULL (observed faulting at offset 0x3c7 into
++		// a null seqp_ during gameplay).
++		if (!curr->track) {
++			continue;
++		}
++#endif
+ #if defined(VERSION_GPIJ01_01) || defined(VERSION_G98P01_PIKIDEMO) || defined(VERSION_DPIJ01_PIKIDEMO)
+ 		if (Jam_CheckPortIndirect(curr->track, curr->_64, 1) == 1)
+ #else
+@@ -115,13 +161,27 @@ static s32 Jal_FrameWork(void* a)
+ #endif
+ 		{
+ 			if (Jac_ReceiveMessage_Fast(&curr->msgQueue, &message) == 1) {
+-				result = Jam_WritePortAppDirect(curr->track, curr->_64, (u16)message);
++				result = Jam_WritePortAppDirect(curr->track, curr->_64, (u16)(uintptr_t)message);
++#if defined(TARGET_PC)
++				g_pc_cmdq_delivered++;
++				pc_result_set = 1;
++#endif
+ 			}
+ 		}
++#if defined(TARGET_PC)
++		else if (curr->msgQueue.usedCount) {
++			g_pc_cmdq_blocked++;
++		}
++#endif
+ 	}
+ 
+ 	// I think they accidentally wrote UB or something, idk man.  This is effectively what the function does,
+ 	// but explicitly doing so makes the compiler shuffle the value in and out of a more permanent register.
++#if defined(TARGET_PC)
++	if (!pc_result_set) {
++		PC_UNINIT_HIT("cmdqueue.c:159 result", 0);
++	}
++#endif
+ #if defined(BUGFIX)
+ 	return result;
+ #endif
+diff --git a/src/jaudio/connect.c b/src/jaudio/connect.c
+index 026d433..871224c 100644
+--- a/src/jaudio/connect.c
++++ b/src/jaudio/connect.c
+@@ -1,8 +1,15 @@
+ #include "jaudio/connect.h"
+ #include "jaudio/aramcall.h"
++#include "jaudio/dvdthread.h"
++#include <stdlib.h>
++#include "Dolphin/os.h"
++#include "jaudio/pc_dsp.h"
+ #include "jaudio/bx.h"
+ #include "jaudio/heapctrl.h"
+ #include <stddef.h>
++#if defined(TARGET_PC)
++static int pc_aram_log(void) { static int v = -1; if (v < 0) v = getenv("PC_ARAM_LOG") ? 1 : 0; return v; }
++#endif
+ 
+ static s16 WS_V2P_TABLE[0x100];
+ static s16 BNK_V2P_TABLE[0x100];
+@@ -16,9 +23,33 @@ static int UpdateWave(WaveArchive_* arc, Ctrl_* ctrl, u32 base)
+ 	for (; i < ctrl->count; i++) {
+ 		WaveID_* wave = ctrl->waveIDs[i];
+ 		wave->data    = arc->waves[i + base];
+-		if (arc->heap.startAddress) {
+-			Jac_SelfAllocHeap(&wave->heap, &arc->heap, wave->data->length + 0x1f & 0xffffffe0,
+-			                  arc->heap.startAddress + wave->data->srcAddress);
++		if (getenv("PC_DSP_SURVEY")) {
++			static int n;
++			if (n < 400) {
++				n++;
++				OSReport("[ARC] '%s' arcHeap=0x%08x wave[%u] id=0x%08x fmt=%u src=0x%08x len=%d -> waveBase=0x%08x\n",
++				         arc->filePath, JAU_HEAP(arc->heap).startAddress, (u32)(i + base), (u32)wave->id,
++				         (unsigned)wave->data->compBlockIdx, (u32)(s32)wave->data->srcAddress, (int)wave->data->length,
++				         JAU_HEAP(arc->heap).startAddress + (u32)(s32)wave->data->srcAddress);
++			}
++		}
++		if (JAU_HEAP(arc->heap).startAddress) {
++			const u32 want = JAU_HEAP(arc->heap).startAddress + wave->data->srcAddress;
++			const u32 had  = JAU_HEAP(wave->heap).startAddress;
++			BOOL ok        = Jac_SelfAllocHeap(&JAU_HEAP(wave->heap), &JAU_HEAP(arc->heap),
++			                                   wave->data->length + 0x1f & 0xffffffe0, want);
++#if defined(TARGET_PC)
++			// Jac_SelfAllocHeap REFUSES when the heap already carries an
++			// address. If that happens the wave silently keeps its OLD base —
++			// i.e. it points into a different archive's ARAM. That is the
++			// shape of the menu static: real AFC data, wrong archive.
++			if (pc_aram_log() && !ok) {
++				OSReport("[STALE] '%s' wave %u kept base 0x%08x, wanted 0x%08x (delta %d)\n",
++				         (const char*)arc->filePath, i, had, want, (int)(had - want));
++			}
++#else
++			(void)ok; (void)had; (void)want;
++#endif
+ 		}
+ 	}
+ 	return i + base;
+@@ -34,7 +65,16 @@ static BOOL UpdateWave_Extern(WaveArchiveBank_* bank, CtrlGroup_* group, Ctrl_*
+ 		wave  = ctrl->waveIDs[i];
+ 		u32 a = wave->id >> 16;
+ 		u32 b = wave->id & 0xffff;
+-		if (wave->heap.startAddress) {
++		if (JAU_HEAP(wave->heap).startAddress) {
++#if defined(TARGET_PC)
++			// The wave keeps whatever base it already has. If the data it
++			// pointed at has since moved (compaction) or been freed and
++			// reloaded, this is the stale-base path.
++			if (pc_aram_log()) {
++				OSReport("[EXTERN] keep  id=0x%08x scene=%u idx-in-ctrl=%u base=0x%08x\n", (u32)wave->id, a, i,
++				         (u32)JAU_HEAP(wave->heap).startAddress);
++			}
++#endif
+ 			continue;
+ 		}
+ 		Ctrl_* cdf = group->scenes[a]->cdf;
+@@ -49,18 +89,36 @@ static BOOL UpdateWave_Extern(WaveArchiveBank_* bank, CtrlGroup_* group, Ctrl_*
+ 		}
+ 
+ 		if (index != cdf->count) {
++#if defined(TARGET_PC)
++			auto* wave2 = &cdf->waveIDs[index]; // PC: a 4-byte file slot, not a WaveID_*
++#else
+ 			WaveID_** wave2 = &cdf->waveIDs[index];
+-			if ((*wave2)->heap.startAddress) {
++#endif
++			if (JAU_HEAP((*wave2)->heap).startAddress) {
+ 				wave->data = (*wave2)->data;
+-				Jac_SelfInitHeap(&wave->heap, (*wave2)->heap.startAddress, 0, (*wave2)->heap.memoryType);
+-				Jac_SetGroupHeap(&wave->heap, &(*wave2)->heap);
++				Jac_SelfInitHeap(&JAU_HEAP(wave->heap), JAU_HEAP((*wave2)->heap).startAddress, 0, JAU_HEAP((*wave2)->heap).memoryType);
++				Jac_SetGroupHeap(&JAU_HEAP(wave->heap), &JAU_HEAP((*wave2)->heap));
++#if defined(TARGET_PC)
++				if (pc_aram_log()) {
++					OSReport("[EXTERN] copy  id=0x%08x scene=%u idx=%u base=0x%08x (aliases loaded wave)\n",
++					         (u32)wave->id, a, index, (u32)JAU_HEAP(wave->heap).startAddress);
++				}
++#endif
+ 			} else {
+ 				WaveArchive_* wave3        = bank->waveGroups[a];
+ 				wave->data                 = wave3->waves[index];
+ 				wave->loadStatus           = 0;
+ 				wave->data->fileLoadStatus = &wave->loadStatus;
+-				LoadAram_One(wave3->filePath, wave->data->srcAddress, wave->data->length, &wave->loadStatus, &wave->heap);
+-				Jac_SetGroupHeap(&wave->heap, &wave3->heap);
++				LoadAram_One(wave3->filePath, wave->data->srcAddress, wave->data->length, &wave->loadStatus, &JAU_HEAP(wave->heap));
++				Jac_SetGroupHeap(&JAU_HEAP(wave->heap), &JAU_HEAP(wave3->heap));
++#if defined(TARGET_PC)
++				if (pc_aram_log()) {
++					OSReport("[EXTERN] load  id=0x%08x scene=%u idx=%u '%s' src=0x%08x len=%d -> base=0x%08x..0x%08x\n",
++					         (u32)wave->id, a, index, (const char*)wave3->filePath, (u32)(s32)wave->data->srcAddress,
++					         (int)wave->data->length, (u32)JAU_HEAP(wave->heap).startAddress,
++					         (u32)(JAU_HEAP(wave->heap).startAddress + wave->data->length));
++				}
++#endif
+ 			}
+ 		}
+ 	}
+@@ -77,7 +135,54 @@ void Jac_SceneClose(WaveArchiveBank_* bank, CtrlGroup_* group, u32 id, BOOL set)
+ 
+ 	scene = group->scenes[id];
+ 	arc   = bank->waveGroups[id];
+-	Jac_DeleteHeap(&arc->heap);
++#if defined(TARGET_PC)
++	// A queued DVD->ARAM load holds its destination by value; freeing (and
++	// then compacting into) this region while one is in flight lets a whole
++	// archive land over whatever reuses the space. Measured: demose's load
++	// sweeping select_0.aw's waves on menu entry — the menu static.
++	pc_dvdt_drain();
++	// Stop voices still reading this archive BEFORE its ARAM is released —
++	// otherwise they decode whatever the next archive loads over it.
++	if (pc_aram_log()) {
++		OSReport("[SCENE] CLOSE id=%2u '%s' aram=0x%08x..0x%08x\n", id,
++		         (const char*)arc->filePath, (u32)JAU_HEAP(arc->heap).startAddress,
++		         (u32)(JAU_HEAP(arc->heap).startAddress + JAU_HEAP(arc->heap).size));
++	}
++	pc_dsp_stop_voices_in_aram(JAU_HEAP(arc->heap).startAddress, JAU_HEAP(arc->heap).size);
++	// PC_ARAM_LOG=1: the DeleteHeap below must cascade to every wave heap
++	// carved out of this archive (they are its children), or stale bases
++	// survive the close and later resolve into whatever archive reuses this
++	// ARAM — measured as the menu-jingle static.
++	{
++		jaheap_* kids[64];
++		u32 nkids = 0;
++		if (pc_aram_log()) {
++			u32 nz = 0;
++			for (jaheap_* c = JAU_HEAP(arc->heap).firstChild; c && nkids < 64; c = c->nextSibling) {
++				kids[nkids++] = c;
++				if (c->startAddress == 0) {
++					nz++;
++				}
++			}
++			OSReport("[SCENE] CLOSE '%s': arc heap has %u child wave heaps (%u already zero) before delete\n",
++			         (const char*)arc->filePath, nkids, nz);
++		}
++		Jac_DeleteHeap(&JAU_HEAP(arc->heap));
++		if (pc_aram_log()) {
++			u32 still = 0;
++			for (u32 k = 0; k < nkids; k++) {
++				if (kids[k]->startAddress != 0) {
++					still++;
++				}
++			}
++			OSReport("[SCENE] CLOSE '%s': after delete, %u of %u child heaps STILL NONZERO\n",
++			         (const char*)arc->filePath, still, nkids);
++		}
++	}
++#endif
++#if !defined(TARGET_PC)
++	Jac_DeleteHeap(&JAU_HEAP(arc->heap));
++#endif
+ 	arc->fileLoadStatus = 0;
+ 
+ 	if (set && scene->dependencyCount) {
+@@ -105,7 +210,7 @@ BOOL Jac_SceneSet(WaveArchiveBank_* bank, CtrlGroup_* group, u32 id, BOOL set)
+ 	arc = bank->waveGroups[id];
+ 	!arc;
+ 
+-	if (arc->heap.startAddress && arc->fileLoadStatus) {
++	if (JAU_HEAP(arc->heap).startAddress && arc->fileLoadStatus) {
+ 		for (i = 0; i < arc->waveCount; i++) {
+ 			arc->waves[i]->fileLoadStatus = &arc->fileLoadStatus;
+ 		}
+@@ -115,11 +220,35 @@ BOOL Jac_SceneSet(WaveArchiveBank_* bank, CtrlGroup_* group, u32 id, BOOL set)
+ 			arc->waves[i]->fileLoadStatus = &arc->fileLoadStatus;
+ 		}
+ 
+-		if (LoadAram_All(arc->filePath, &arc->fileLoadStatus, &arc->heap) == 0) {
++		if (LoadAram_All(arc->filePath, &arc->fileLoadStatus, &JAU_HEAP(arc->heap)) == 0) {
+ 			return FALSE;
+ 		}
+ 	}
+ 
++#if defined(TARGET_PC)
++	// PC_ARAM_LOG=1: archive lifecycle with IDENTITY. Address-only logs cannot
++	// answer "which archive owns this range, and was it closed first?", which
++	// is exactly the question the menu-static localisation ran into.
++	if (pc_aram_log()) {
++		OSReport("[SCENE] OPEN  id=%2u '%s' group=%p set=%d aram=0x%08x..0x%08x (len 0x%x)\n", id,
++		         (const char*)arc->filePath, (void*)group, (int)set, (u32)JAU_HEAP(arc->heap).startAddress,
++		         (u32)(JAU_HEAP(arc->heap).startAddress + JAU_HEAP(arc->heap).size),
++		         (u32)JAU_HEAP(arc->heap).size);
++		// Verify the liveness wiring stuck: every wave record of this archive
++		// must gate on THIS archive's status word. A record shared with
++		// another archive keeps whichever wiring ran LAST — the mechanism that
++		// let a closed scene's waves pass GetSoundHandle.
++		u32 miswired = 0;
++		for (i = 0; i < arc->waveCount; i++) {
++			if ((u32*)arc->waves[i]->fileLoadStatus != &arc->fileLoadStatus) {
++				miswired++;
++			}
++		}
++		OSReport("[SCENE] OPEN  '%s': %u/%u wave records wired to this arc's status (miswired=%u, fls[0]=%p expect=%p)\n",
++		         (const char*)arc->filePath, (u32)arc->waveCount - miswired, (u32)arc->waveCount, miswired,
++		         arc->waveCount ? (void*)(u32*)arc->waves[0]->fileLoadStatus : NULL, (void*)&arc->fileLoadStatus);
++	}
++#endif
+ 	scene = group->scenes[id];
+ 	cdf   = scene->cdf;
+ 	if (cdf) {
+@@ -141,6 +270,26 @@ BOOL Jac_SceneSet(WaveArchiveBank_* bank, CtrlGroup_* group, u32 id, BOOL set)
+ 	STACK_PAD_VAR(6);
+ }
+ 
++#if defined(TARGET_PC)
++// PC_ARAM_LOG=1: which scene's ctrl satisfied a wave-id lookup, with the
++// liveness facts the accept path is about to trust. The menu static came from
++// a CLOSED scene's entry winning this search with a stale base.
++static void pc_gsh_trace(const char* which, u32 sceneId, u16 wId, WaveID_* wave)
++{
++	if (!pc_aram_log()) {
++		return;
++	}
++	static u32 n;
++	if (++n > 4000) {
++		return;
++	}
++	u32* st = wave->data->fileLoadStatus;
++	OSReport("[GSH] t=%.2f id=0x%04x via scene %u %s: base=0x%08x fileLoadStatus=%p(*=%u) waveLoadStatus=%u\n",
++	         pc_dsp_time(), (unsigned)wId, sceneId, which, (u32)JAU_HEAP(wave->heap).startAddress, (void*)st,
++	         st ? *st : 0, (unsigned)wave->loadStatus);
++}
++#endif
++
+ /**
+  * @TODO: Documentation
+  */
+@@ -167,7 +316,10 @@ WaveID_* __GetSoundHandle(CtrlGroup_* group, u32 id, u32 id2)
+ 	ctrl = scene->cdf;
+ 	if (ctrl) {
+ 		WaveID_* wave = SearchWave(ctrl, wId);
+-		if (wave && wave->data && (int)wave->data != 0xffffffff) {
++		if (wave && wave->data && JAU_PTR_RAW(wave->data) != 0xffffffff) {
++#if defined(TARGET_PC)
++			pc_gsh_trace("cdf", id2, wId, wave);
++#endif
+ 			return wave;
+ 		}
+ 	}
+@@ -175,14 +327,17 @@ WaveID_* __GetSoundHandle(CtrlGroup_* group, u32 id, u32 id2)
+ 	ctrl = scene->cex;
+ 	if (ctrl) {
+ 		WaveID_* wave = SearchWave(ctrl, wId);
+-		if (wave && wave->data && (int)wave->data != 0xffffffff) {
++		if (wave && wave->data && JAU_PTR_RAW(wave->data) != 0xffffffff) {
++#if defined(TARGET_PC)
++			pc_gsh_trace("cex", id2, wId, wave);
++#endif
+ 			return wave;
+ 		}
+ 	}
+ 
+ 	for (u32 i = 0; i < scene->dependencyCount; i++) {
+ 		WaveID_* wave = __GetSoundHandle(group, id, scene->dependencyIds[i]);
+-		if (wave && wave->data && (int)wave->data != 0xffffffff) {
++		if (wave && wave->data && JAU_PTR_RAW(wave->data) != 0xffffffff) {
+ 			return wave;
+ 		}
+ 	}
+@@ -239,7 +394,7 @@ u16 Jac_BnkVirtualToPhysical(u16 vID)
+  */
+ u16 Jac_BnkPhysicalToVirtual(u16 bnk)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+@@ -248,7 +403,7 @@ u16 Jac_BnkPhysicalToVirtual(u16 bnk)
+  */
+ u16 Jac_WsPhysicalToVirtual(u16 ws)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(0);
+ }
+ 
+ /**
+diff --git a/src/jaudio/driverinterface.c b/src/jaudio/driverinterface.c
+index 8eef0f7..06f6a60 100644
+--- a/src/jaudio/driverinterface.c
++++ b/src/jaudio/driverinterface.c
+@@ -1,4 +1,6 @@
+ #include "jaudio/driverinterface.h"
++#include "Dolphin/os.h"
++#include <stdlib.h>
+ 
+ #include "jaudio/aictrl.h"
+ #include "jaudio/audiostruct.h"
+@@ -6,6 +8,8 @@
+ #include "jaudio/dspdriver.h"
+ #include "jaudio/dspinterface.h"
+ #include "jaudio/ja_calc.h"
++#include "jaudio/pc_dsp.h"
++#include "pc_uninit.h"
+ #include <stddef.h>
+ 
+ #include <stddef.h>
+@@ -582,10 +586,47 @@ void UpdateEffecterParam(jc_* jc)
+ 		dolby = PanCalc(&jc->panMatrices[3], &jc->panMatrices[0], jc->panCalcTypes[2]);
+ 		break;
+ 	}
++	// Census -Wconditional-uninitialized (`pan`, `fxmix`): AUDITED NON-BUG.
++	// JAC_SYSTEM_OUTPUT_MODE's only writer is Jac_SetOutputMode, and its only
++	// caller is gamePrefs.cpp:117 — `Jac_OutputMode((mFlags & GAMEPREF_Stereo)
++	// ? 1 : 0)`. The domain is exactly {0,1}, so these two cases are
++	// exhaustive and the fall-through is unreachable. Left without a `default:`
++	// so the shape still matches retail.
+ 	}
+ 
+ 	volume = jc->currentVolume * jc->volumeModifier * jc->managerVolume;
+ 
++#if defined(TARGET_PC)
++	// PC_VOLTRACE=1: name the component behind single-frame volume dips —
++	// the tap shows targetVolume gouging down for one frame at ~tremolo rate
++	// on the menu synths, which is the audible crackle.
++	{
++		static int vt = -1;
++		if (vt < 0) {
++			vt = getenv("PC_VOLTRACE") ? 1 : 0;
++		}
++		if (vt) {
++			// Previous composite volume per jc, in a side table (the structs
++			// have no spare slot and their layout is file-fixed).
++			static const jc_* keys[256];
++			static f32 prevs[256];
++			u32 h    = (u32)(((uintptr_t)jc >> 4) & 0xff);
++			f32 prev = (keys[h] == jc) ? prevs[h] : 0.0f;
++			if (prev > 0.0001f && volume < prev * 0.8f && pc_dsp_time() >= 8.0) {
++				static u32 n;
++				if (++n <= 300) {
++					OSReport("[VOLDIP] t=%.2f jc=%p vol %f -> %f (cur=%f mod=%f mgr=%f) osc0=%p st=%d osc1=%p st=%d\n",
++					         pc_dsp_time(), (void*)jc, (double)prev, (double)volume, (double)jc->currentVolume,
++					         (double)jc->volumeModifier, (double)jc->managerVolume, (void*)jc->mOscillators[0],
++					         (int)jc->mOscBuffers[0].state, (void*)jc->mOscillators[1], (int)jc->mOscBuffers[1].state);
++				}
++			}
++			keys[h]  = jc;
++			prevs[h] = volume;
++		}
++	}
++#endif
++
+ 	if (pan < 0.0f) {
+ 		pan = 0.0f;
+ 	} else if (pan > 1.0f) {
+@@ -648,6 +689,26 @@ void UpdateEffecterParam(jc_* jc)
+ 				angle = 1.0f - dolby;
+ 				break;
+ 			}
++			// PC probe: `lower0` is a 4-bit field out of BANK DATA, so 4 and
++			// 8..15 are representable and unhandled — the switch covers only
++			// 1,2,3,5,6,7 (source in the low 2 bits, "invert" in bit 2). A
++			// fall-through leaves `angle` at the zero -ftrivial-auto-var-init
++			// gives it, and sinf3(0) is SINTABLE[0] = 0, so `tmp` collapses and
++			// this mix bus goes SILENT. Retail reused the stack slot instead,
++			// which is a different answer — that makes this a divergence from
++			// hardware, not shared UB. Whether bank data ever gets here is a
++			// measurement, not a reading: PC_UNINIT_PROBE=1.
++		default:
++			PC_UNINIT_HIT("driverinterface.c:686 angle", config.parts.lower0);
++			// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++			// already zeroes this variable at its declaration and nothing assigns it on the
++			// path that reaches here, so this writes the value that is already there. It is
++			// present because adding a `default:` label PROMOTES the diagnostic from
++			// -Wconditional-uninitialized (not in the always-on set) to
++			// -Wsometimes-uninitialized (which is), and this branch must not spend the
++			// clean-build property to buy instrumentation.
++			angle = 0.0f;
++			break;
+ 			}
+ 			tmp *= sinf3(angle);
+ 		}
+@@ -684,6 +745,12 @@ void UpdateEffecterParam(jc_* jc)
+ 				angle = 1.0f - dolby;
+ 				break;
+ 			}
++			// PC probe: same shape as the lower0 switch above, and note `angle`
++			// is scoped to the loop body, so a fall-through here does NOT carry
++			// the value lower0 just computed — it re-reads zero.
++		default:
++			PC_UNINIT_HIT("driverinterface.c:722 angle", config.parts.lower1);
++			break;
+ 			}
+ 			tmp *= sinf3(angle);
+ 		}
+@@ -917,7 +984,13 @@ BOOL StopLogicalChannel(jc_* jc)
+ 	jc->dspChannel->callbackTimer = 0;
+ 	DSP_PlayStop(jc->dspChannel->buffer_idx);
+ 	DSP_FlushChannel(jc->dspChannel->buffer_idx);
+-	DeAllocDSPchannel(jc->dspChannel, (u32)jc);
++	// PC: must match the value AllocDSPchannel stored — DeAllocDSPchannel
++	// compares chan->logicalChan against this and refuses (-2) on mismatch.
++	// Truncating here while allocation stored the full pointer meant NO
++	// channel was ever released: the 64-entry pool filled monotonically
++	// (1 -> 8 -> 26 -> 46 -> 62 -> 64 and pinned), after which every new note
++	// and the audio stream failed to allocate.
++	DeAllocDSPchannel(jc->dspChannel, (uintptr_t)jc);
+ 	jc->dspChannel = NULL;
+ 	return TRUE;
+ }
+@@ -1069,12 +1142,17 @@ void __Entry_WaitChannel(u8 a)
+ 	while (cur_waits != 0) {
+ 		jc = waitp[cur_top];
+ 		if (jc) {
+-			ch = AllocDSPchannel(0, (u32)jc);
++			ch = AllocDSPchannel(0, (uintptr_t)jc);
+ 			if (ch == NULL) {
+ 				break;
+ 			}
+ 			jc->dspChannel = ch;
+ 			PlayLogicalChannel(jc);
++#if defined(TARGET_PC)
++			// The SOUNDID_ that queued the note is gone by now; the jc_'s own
++			// soundId snapshot is the best identity the wait path still has.
++			pc_dsp_tag_voice(ch->buffer_idx, 0, jc->soundId, jc->note, 'W', jc);
++#endif
+ 			if (List_CutChannel(jc) != -1) {
+ 				List_AddChannelTail(&jc->chanMgr->activeChannels, jc);
+ 			}
+diff --git a/src/jaudio/dsp_cardunlock.c b/src/jaudio/dsp_cardunlock.c
+index c693280..56458aa 100644
+--- a/src/jaudio/dsp_cardunlock.c
++++ b/src/jaudio/dsp_cardunlock.c
+@@ -260,6 +260,12 @@ static void DoneCallback(void* dspTask)
+ 	}
+ 	OSAssertLine(548, 0 <= chan && chan < 2);
+ 
++	// Census -Wconditional-uninitialized (`card`): AUDITED NON-BUG. The `for
++	// (chan = 0; chan < 2; ++chan)` above has a constant trip count of at least
++	// one and assigns `card` unconditionally as its first statement, so `card`
++	// always holds at least channel 0. clang will not prove a one-or-more-trip
++	// loop executes; that is the whole of the complaint.
++
+ 	// The nonsense
+ 	CARDDecodeParameters* param = (CARDDecodeParameters*)card->workArea;
+ 	u8* input                   = (u8*)param + sizeof(CARDDecodeParameters);
+diff --git a/src/jaudio/dspboot.c b/src/jaudio/dspboot.c
+index d233fba..3e807dc 100644
+--- a/src/jaudio/dspboot.c
++++ b/src/jaudio/dspboot.c
+@@ -474,7 +474,7 @@ s32 __DSPCheckMXICBoot2(DSPTaskInfo2* task)
+ 		while (DSPCheckMailToDSP() != 0)
+ 			;
+ 
+-		DSPSendMailToDSP((u32)task->iram_mmem_addr);
++		DSPSendMailToDSP(PC_PTR_TO_U32(task->iram_mmem_addr));
+ 		while (DSPCheckMailToDSP() != 0)
+ 			;
+ 
+@@ -522,7 +522,7 @@ s32 __DSPCheckMXICBoot2(DSPTaskInfo2* task)
+ 		while (DSPCheckMailToDSP() != 0)
+ 			;
+ 
+-		DSPSendMailToDSP(((u32)task->iram_mmem_addr >> 16) | 0xC0010000);
++		DSPSendMailToDSP((PC_PTR_TO_U32(task->iram_mmem_addr) >> 16) | 0xC0010000);
+ 		while (DSPCheckMailToDSP() != 0)
+ 			;
+ 
+@@ -530,7 +530,7 @@ s32 __DSPCheckMXICBoot2(DSPTaskInfo2* task)
+ 		while (DSPCheckMailToDSP() != 0)
+ 			;
+ 
+-		DSPSendMailToDSP(((u32)task->iram_mmem_addr & 0xffff) | 0xC0010000);
++		DSPSendMailToDSP((PC_PTR_TO_U32(task->iram_mmem_addr) & 0xffff) | 0xC0010000);
+ 		while (DSPCheckMailToDSP() != 0)
+ 			;
+ 
+diff --git a/src/jaudio/dspbuf.c b/src/jaudio/dspbuf.c
+index afd9f6a..5e08c6c 100644
+--- a/src/jaudio/dspbuf.c
++++ b/src/jaudio/dspbuf.c
+@@ -72,7 +72,7 @@ s16* DspbufProcess(DSPBUF_EVENTS event)
+ #if defined(VERSION_GPIP01)
+ 			DsyncFrame2(JAC_SUBFRAMES, (u32)dsp_buf[write_buffer], (u32)&dsp_buf[write_buffer][JAC_FRAMESAMPLES]);
+ #else
+-			DsyncFrame(JAC_SUBFRAMES, (u32)dsp_buf[write_buffer], (u32)&dsp_buf[write_buffer][JAC_FRAMESAMPLES]);
++			DsyncFrame(JAC_SUBFRAMES, (uintptr_t)dsp_buf[write_buffer], (uintptr_t)&dsp_buf[write_buffer][JAC_FRAMESAMPLES]);
+ #endif
+ 			dspstatus = 1;
+ 			UpdateDSP();
+diff --git a/src/jaudio/dspdriver.c b/src/jaudio/dspdriver.c
+index 56bbaf7..a8baba1 100644
+--- a/src/jaudio/dspdriver.c
++++ b/src/jaudio/dspdriver.c
+@@ -4,6 +4,7 @@
+ #include "jaudio/audiothread.h"
+ #include "jaudio/driverinterface.h"
+ #include "jaudio/dspinterface.h"
++#include "jaudio/pc_dsp.h"
+ #include "jaudio/rate.h"
+ 
+ #include <stddef.h>
+@@ -47,12 +48,68 @@ void InitDSPchannel()
+ /**
+  * @TODO: Documentation
+  */
+-dspch_* AllocDSPchannel(u32 param_1, u32 param_2)
++// PC: param_2 is the owning logical channel — a POINTER, stored straight into
++// dspch_::logicalChan and later dereferenced by CommonCallbackLogicalChannel.
++// Declared u32 it was truncated on LP64 and the first callback faulted on a
++// 0x05238010-class address. Same overloaded-slot family as Init_Track's
++// dataAddress and the DVD callback owner.
++#if defined(TARGET_PC)
++// PC diagnostic: PC_DSP_SURVEY=1 reports DSP channel pool occupancy, to tell a
++// genuine leak (climbs monotonically to 64 and stays) from ordinary churn.
++u32 pc_dspch_in_use(void)
++{
++	u32 n = 0;
++	for (int i = 0; i < DSPCH_LENGTH; i++) {
++		if (DSPCH[i].allocState != DSPCHAN_Free) {
++			n++;
++		}
++	}
++	return n;
++}
++
++// Channels the CPU has asked to stop. Should be transient — a persistently
++// non-zero count means the renderer is not completing them.
++u32 pc_dspch_stopping(void)
++{
++	u32 n = 0;
++	for (int i = 0; i < DSPCH_LENGTH; i++) {
++		if (DSPCH[i].allocState == DSPCHAN_Stopping) {
++			n++;
++		}
++	}
++	return n;
++}
++
++// PC_DSP_LOOPTAG: driver-side state of one channel, for the looping-voice
++// report. ownerPointsBack distinguishes a live owner (jc->dspChannel still
++// aims here) from one that moved on without stopping the voice. For stream
++// channels logicalChan is not a jc_ (syncstream stores its own slot pointer),
++// so the caller uses the tag's kind to know when these fields are noise.
++u32 pc_dspch_probe(u32 idx, const void** owner, int* ownerSoundId, int* ownerPointsBack, int* hasCb)
++{
++	dspch_* ch = &DSPCH[idx];
++	if (owner) {
++		*owner = ch->logicalChan;
++	}
++	if (ownerSoundId) {
++		*ownerSoundId = ch->logicalChan ? ch->logicalChan->soundId : 0;
++	}
++	if (ownerPointsBack) {
++		*ownerPointsBack = ch->logicalChan && ch->logicalChan->dspChannel == ch;
++	}
++	if (hasCb) {
++		*hasCb = ch->logicalChanCb != NULL;
++	}
++	return ch->allocState;
++}
++#endif
++
++dspch_* AllocDSPchannel(u32 param_1, uintptr_t param_2)
+ {
+ 
+ 	s32 i;
+ 	STACK_PAD_VAR(1);
+-	u32* REF_param_2 = &param_2;
++	uintptr_t* REF_param_2 = &param_2;
+ 	s32* REF_i       = &i;
+ 	if (param_1 == 0) {
+ 
+@@ -87,12 +144,17 @@ dspch_* AllocDSPchannel(u32 param_1, u32 param_2)
+ /**
+  * @TODO: Documentation
+  */
+-int DeAllocDSPchannel(dspch_* chan, u32 id)
++int DeAllocDSPchannel(dspch_* chan, uintptr_t id)
+ {
+ 	if (chan == NULL) {
+ 		return -1;
+ 	}
+ 	if (chan->logicalChan != (jc_*)id) {
++#if defined(TARGET_PC)
++		// A refused dealloc leaves the channel allocated with nobody to stop
++		// it — the exact shape of the looping-voice leak. Silent in retail.
++		pc_dsp_note_dealloc_miss(chan->buffer_idx, (const void*)id, chan->logicalChan);
++#endif
+ 		return -2;
+ 	}
+ 
+@@ -119,6 +181,9 @@ int DeAllocDSPchannel(dspch_* chan, u32 id)
+ 	chan->prio          = 0;
+ 	chan->logicalChanCb = NULL;
+ 	chan->logicalChan   = NULL;
++#if defined(TARGET_PC)
++	pc_dsp_untag_voice(chan->buffer_idx);
++#endif
+ 	return 0;
+ 
+ 	STACK_PAD_VAR(2);
+diff --git a/src/jaudio/dspinterface.c b/src/jaudio/dspinterface.c
+index 634c69c..fa051e3 100644
+--- a/src/jaudio/dspinterface.c
++++ b/src/jaudio/dspinterface.c
+@@ -1,5 +1,6 @@
+ #include "jaudio/dspinterface.h"
+ 
++#include <stdlib.h>
+ #include "Dolphin/os.h"
+ #include "jaudio/driverinterface.h"
+ #include "jaudio/dspdriver.h"
+@@ -30,7 +31,7 @@ DSPchannel_* GetDspHandle(u8 idx)
+  */
+ DSPchannel_* GetDspHandleNc(u8)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(nullptr);
+ }
+ 
+ /**
+@@ -47,7 +48,7 @@ FXBuffer* GetFxHandle(u8 idx)
+  */
+ FXBuffer* GetFxHandleNc(u8 idx)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(nullptr);
+ }
+ 
+ /**
+@@ -423,7 +424,7 @@ static u32 DSPRES_FILTER[] ATTRIBUTE_ALIGN(32) = {
+  */
+ void DSP_SetupBuffer()
+ {
+-	DsetupTable((u32)CH_BUF_LENGTH, (u32)CH_BUF, (u32)DSPRES_FILTER, (u32)DSPADPCM_FILTER, (u32)FX_BUF);
++	DsetupTable((u32)CH_BUF_LENGTH, (uintptr_t)CH_BUF, (uintptr_t)DSPRES_FILTER, (uintptr_t)DSPADPCM_FILTER, (uintptr_t)FX_BUF);
+ }
+ 
+ /**
+diff --git a/src/jaudio/dspproc.c b/src/jaudio/dspproc.c
+index 987c960..4d371fa 100644
+--- a/src/jaudio/dspproc.c
++++ b/src/jaudio/dspproc.c
+@@ -1,4 +1,5 @@
+ #include "jaudio/dspproc.h"
++#include "jaudio/pc_dsp.h"
+ #include "Dolphin/dsp.h"
+ #include "Dolphin/os.h"
+ #include "jaudio/dspinterface.h"
+@@ -240,8 +241,15 @@ void Dadpcmtest(u32)
+ /**
+  * @TODO: Documentation
+  */
+-void DsetupTable(u32 cmd1, u32 cmd2, u32 cmd3, u32 cmd4, u32 cmd5)
++void DsetupTable(u32 cmd1, uintptr_t cmd2, uintptr_t cmd3, uintptr_t cmd4, uintptr_t cmd5)
+ {
++#if defined(TARGET_PC)
++	// PC: bypass the mailbox entirely. The commands[] array below is u32, which
++	// would truncate all four table pointers on LP64 — an M1 audit item filed
++	// as "M5 replaces wholesale". This is that replacement.
++	pc_dsp_setup_table(cmd1 & 0xFFFF, (void*)cmd2, (void*)cmd3, (void*)cmd4, (void*)cmd5);
++	return;
++#else
+ 	u32 commands[5];
+ 
+ 	commands[0] = (cmd1 & 0xFFFF) | 0x81000000;
+@@ -258,6 +266,7 @@ void DsetupTable(u32 cmd1, u32 cmd2, u32 cmd3, u32 cmd4, u32 cmd5)
+ 	DSPSendCommands(commands, ARRAY_SIZE(commands));
+ 	DSPWaitFinish();
+ #endif
++#endif
+ }
+ 
+ /**
+@@ -271,8 +280,16 @@ void DsetMixerLevel(f32 level)
+ /**
+  * @TODO: Documentation
+  */
+-void DsyncFrame(u32 subframes, u32 dspbufStart, u32 dspbufEnd)
++void DsyncFrame(u32 subframes, uintptr_t dspbufStart, uintptr_t dspbufEnd)
+ {
++#if defined(TARGET_PC)
++	// PC: render the frame here. start/end are the two PLANAR channel bases —
++	// start is right, end is left; see include/jaudio/pc_dsp.h for how that was
++	// pinned down from Jac_VframeWork's mixdown.
++	pc_dsp_set_mixer_level(DSP_MIXERLEVEL);
++	pc_dsp_sync_frame(subframes, (s16*)dspbufStart, (s16*)dspbufEnd);
++	return;
++#else
+ 	u32 commands[3];
+ 
+ 	u32 val = (subframes << 16 & 0xFF0000);
+@@ -288,6 +305,7 @@ void DsyncFrame(u32 subframes, u32 dspbufStart, u32 dspbufEnd)
+ 	DSPSendCommands(commands, ARRAY_SIZE(commands));
+ 	DSPWaitFinish();
+ #endif
++#endif
+ }
+ 
+ /**
+@@ -295,11 +313,15 @@ void DsyncFrame(u32 subframes, u32 dspbufStart, u32 dspbufEnd)
+  */
+ void DwaitFrame()
+ {
++#if defined(TARGET_PC)
++	pc_dsp_wait_frame();
++#else
+ 	u32 commands[1];
+ 
+ 	commands[0] = 0x80000000;
+ 	DSPSendCommands(commands, ARRAY_SIZE(commands));
+ 	DSPWaitFinish();
++#endif
+ }
+ 
+ /**
+diff --git a/src/jaudio/dummyrom.c b/src/jaudio/dummyrom.c
+index 1329de7..f02560a 100644
+--- a/src/jaudio/dummyrom.c
++++ b/src/jaudio/dummyrom.c
+@@ -95,9 +95,12 @@ void Jac_InitARAM(u32 loadAudiorom)
+ 
+ 	CARD_SECURITY_BUFFER = 0x40;
+ 	audiorom_size += AUDIO_ARAM_TOP;
+-	JAC_ARAM_DMA_BUFFER_TOP = (u8*)audiorom_size;
++	// PC: audiorom_size is an ARAM OFFSET, not a host address — ARAM is its
++	// own 32-bit space. heapctrl.c reads this slot straight back out as
++	// `(uintptr_t)JAC_ARAM_DMA_BUFFER_TOP`, so it is pure transport.
++	JAC_ARAM_DMA_BUFFER_TOP = PC_INT_AS_PTR(u8*, audiorom_size);
+ 	audiorom_size += AUDIO_ARAM_HEAP_SIZE;
+-	Nas_HeapInit(&aram_hp, (u8*)audiorom_size, aram_size - audiorom_size);
++	Nas_HeapInit(&aram_hp, PC_INT_AS_PTR(u8*, audiorom_size), aram_size - audiorom_size);
+ 
+ 	/* Probably leftovers from some debug print statement */
+ 	(void)audiorom_size;
+diff --git a/src/jaudio/dvdthread.c b/src/jaudio/dvdthread.c
+index c74a938..444b2bd 100644
+--- a/src/jaudio/dvdthread.c
++++ b/src/jaudio/dvdthread.c
+@@ -5,6 +5,9 @@
+ #include "jaudio/sample.h"
+ #include <stddef.h>
+ #include <string.h>
++#if defined(TARGET_PC)
++#include <unistd.h>
++#endif
+ 
+ static char audio_root_path[32] = "";
+ 
+@@ -106,12 +109,50 @@ void DVDT_ExtendPath(char* dst, immut char* ext)
+  */
+ s32 DVDT_AddTaskHigh(TaskCallback, void*, size_t)
+ {
+-	TRAP_UNIMPLEMENTED;
++	TRAP_UNIMPLEMENTED_RET(-1);
+ }
+ 
+ /**
+  * @TODO: Documentation
+  */
++#if defined(TARGET_PC)
++// The ARAM race barrier. A queued DVD->ARAM load captured its ARAM
++// destination BY VALUE; freeing or compacting ARAM while one is still in
++// flight lets the write land at a stale address — measured as a whole
++// archive sweeping over select_0.aw's waves on menu entry (the menu static).
++// Anything about to free or MOVE ARAM must wait for those.
++//
++// ONLY ARAM-destined loads count. Draining the whole DVD queue wedges the
++// audio thread whenever the menu music stream keeps the queue busy —
++// observed live as "everything silent except one SE". The wait is also
++// bounded: a barrier that can starve playback is worse than the race.
++static vu32 pc_aram_loads_inflight;
++static vu32 pc_on_dvd_thread;
++
++void pc_dvdt_note_aram_load(int delta)
++{
++	__atomic_add_fetch((u32*)&pc_aram_loads_inflight, (u32)delta, __ATOMIC_SEQ_CST);
++}
++
++u32 pc_dvdt_pending(void)
++{
++	return pc_aram_loads_inflight;
++}
++
++void pc_dvdt_drain(void)
++{
++	if (pc_on_dvd_thread) {
++		return; // a DVD task cannot wait on itself
++	}
++	for (int spins = 0; pc_aram_loads_inflight != 0 && spins < 1000; spins++) {
++		usleep(500); // bounded at 500 ms total
++	}
++	if (pc_aram_loads_inflight != 0) {
++		OSReport("[DVDT] drain timed out with %u ARAM load(s) still in flight\n", pc_aram_loads_inflight);
++	}
++}
++#endif
++
+ s32 DVDT_AddTask(TaskCallback callback, void* stack, size_t len)
+ {
+ 	if (mq_init == FALSE) {
+@@ -162,14 +203,20 @@ void* jac_dvdproc(void*)
+ 				break;
+ 			};
+ 		}
++#if defined(TARGET_PC)
++		pc_on_dvd_thread = 1;
++		(*callback)(callback + 1);
++		pc_on_dvd_thread = 0;
++#else
+ 		(*callback)(callback + 1);
++#endif
+ 	}
+ }
+ 
+ /**
+  * @TODO: Documentation
+  */
+-static void __DoError(DVDCall* call, u32)
++static void __DoError(DVDCall* call, uintptr_t)
+ {
+ 	if (call->callbackStatus != NULL) {
+ 		*call->callbackStatus = -1;
+@@ -183,7 +230,7 @@ static void __DoError(DVDCall* call, u32)
+ /**
+  * @TODO: Documentation
+  */
+-static void __DoFinish(DVDCall* call, u32 status)
++static void __DoFinish(DVDCall* call, uintptr_t status)
+ {
+ 	if (call->callbackStatus != NULL) {
+ 		*call->callbackStatus = status;
+@@ -235,6 +282,19 @@ s32 DVDT_LoadtoDRAM_Main(void* dvdCall)
+ #endif
+ 	}
+ 
++#if defined(TARGET_PC)
++	// PC: a null dst means the caller's allocation failed upstream. On GC this
++	// wrote to low memory and limped on; here it faults inside the read. Be
++	// loud and name the file rather than dying in memset with no context.
++	if (call->dst == 0) {
++		OSReport("[JAUDIO] DVDT_LoadtoDRAM: NULL dst for '%s' (len %u, src %u) — allocation failed upstream\n",
++		         call->fileName, call->length, call->src);
++		__DoError(call, 1);
++		DVDClose(&finfo);
++		return -1;
++	}
++#endif
++
+ 	DCInvalidateRange((void*)call->dst, call->length);
+ 	readStatus |= DVDReadMutex(&finfo, (void*)call->dst, call->length, call->src, call->fileName);
+ 	DVDClose(&finfo);
+@@ -245,7 +305,7 @@ s32 DVDT_LoadtoDRAM_Main(void* dvdCall)
+ /**
+  * @TODO: Documentation
+  */
+-s32 DVDT_LoadtoDRAM(u32 owner, immut char* name, u32 dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback)
++s32 DVDT_LoadtoDRAM(uintptr_t owner, immut char* name, uintptr_t dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback)
+ {
+ 	DVDCall call;
+ 	DVDCall* pCall = &call;
+@@ -367,7 +427,7 @@ void DVDT_GetCurrentBuffer(u8**)
+ /**
+  * @TODO: Documentation
+  */
+-static void ARAM_DMAfinish(u32)
++static void ARAM_DMAfinish(uintptr_t)
+ {
+ 	buffer_full--;
+ }
+@@ -386,12 +446,18 @@ s32 DVDT_LoadtoARAM_Main(void* dvdCall)
+ 
+ 	if (!Jac_DVDOpen(call->fileName, &finfo)) {
+ 		__DoError(call, 0);
++#if defined(TARGET_PC)
++		pc_dvdt_note_aram_load(-1);
++#endif
+ 		return -1;
+ 	}
+ 
+ 	u32 len = finfo.length;
+ 	if (len == 0) {
+ 		__DoError(call, 1);
++#if defined(TARGET_PC)
++		pc_dvdt_note_aram_load(-1);
++#endif
+ 		return -1;
+ 	}
+ 
+@@ -426,7 +492,7 @@ s32 DVDT_LoadtoARAM_Main(void* dvdCall)
+ 			call->length -= buffersize;
+ 		}
+ 
+-		ARQPostRequest(&req[arq_index], 0x12345678, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_HIGH, (u32)buf, call->dst, readSize,
++		ARQPostRequest(&req[arq_index], 0x12345678, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_HIGH, (uintptr_t)buf, call->dst, readSize,
+ 		               ARAM_DMAfinish);
+ 		buffer_full++;
+ 		arq_index++;
+@@ -443,13 +509,16 @@ s32 DVDT_LoadtoARAM_Main(void* dvdCall)
+ 
+ 	__DoFinish(call, len);
+ 
++#if defined(TARGET_PC)
++	pc_dvdt_note_aram_load(-1);
++#endif
+ 	return 0;
+ }
+ 
+ /**
+  * @TODO: Documentation
+  */
+-s32 DVDT_LoadtoARAM(u32 owner, immut char* path, u32 dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback)
++s32 DVDT_LoadtoARAM(uintptr_t owner, immut char* path, u32 dst, u32 src, u32 length, u32* status, Jac_DVDCallback callback)
+ {
+ 	DVDCall call;
+ 	DVDCall* pCall = &call;
+@@ -467,7 +536,18 @@ s32 DVDT_LoadtoARAM(u32 owner, immut char* path, u32 dst, u32 src, u32 length, u
+ 	pCall->src      = src;
+ 	pCall->length   = length;
+ 
+-	DVDT_AddTask(DVDT_LoadtoARAM_Main, pCall, 0x58);
++#if defined(TARGET_PC)
++	// Counted for pc_dvdt_drain: this task writes ARAM at a destination
++	// captured by value, so ARAM must not be freed/compacted under it.
++	pc_dvdt_note_aram_load(+1);
++#endif
++	// PC: 0x58 is sizeof(DVDCall) on the 32-bit target only. On LP64 the struct
++	// is 0x70 (dst widened to uintptr_t, plus two 8-byte pointer fields with
++	// alignment padding), so a hardcoded 0x58 copies the task payload but STOPS
++	// before callbackStatus and callback — the task then runs with a null
++	// callback and completes silently. That is what left boot_ok FALSE forever
++	// and hung the main thread spinning in Jac_CheckBootOk.
++	DVDT_AddTask(DVDT_LoadtoARAM_Main, pCall, sizeof(DVDCall));
+ 
+ 	return 0;
+ }
+@@ -476,7 +556,7 @@ s32 DVDT_LoadtoARAM(u32 owner, immut char* path, u32 dst, u32 src, u32 length, u
+  * @TODO: Documentation
+  * @note UNUSED Size: 000010
+  */
+-void ARAM_DMAfinish2(u32)
++void ARAM_DMAfinish2(uintptr_t)
+ {
+ 	TRAP_UNIMPLEMENTED;
+ 	static DVDFileInfo finfo;
+@@ -551,7 +631,7 @@ s32 DVDT_LoadFile(immut char* file, u8* p2)
+ 	vu32 status           = 0;
+ 	immut char** REF_file = &file;
+ 	STACK_PAD_VAR(2);
+-	DVDT_LoadtoDRAM(0, file, (u32)p2, 0, 0, (u32*)&status, NULL);
++	DVDT_LoadtoDRAM(0, file, (uintptr_t)p2, 0, 0, (u32*)&status, NULL);
+ 
+ 	while (status == 0) { }
+ 
+@@ -565,7 +645,7 @@ s32 DVDT_LoadFile(immut char* file, u8* p2)
+ /**
+  * @TODO: Documentation
+  */
+-void DVDT_CheckPass(u32 owner, u32* status, Jac_DVDCallback callback)
++void DVDT_CheckPass(uintptr_t owner, u32* status, Jac_DVDCallback callback)
+ {
+ 	DVDCall call;
+ 	void* cb = (void*)&call;
+@@ -574,7 +654,7 @@ void DVDT_CheckPass(u32 owner, u32* status, Jac_DVDCallback callback)
+ 	call.callbackStatus = status;
+ 	call.callback       = callback;
+ 
+-	DVDT_AddTask((TaskCallback)__DVDT_CheckBack, cb, 0x58);
++	DVDT_AddTask((TaskCallback)__DVDT_CheckBack, cb, sizeof(DVDCall)); // PC: see DVDT_LoadtoARAM
+ }
+ 
+ /**
+diff --git a/src/jaudio/file_seq.c b/src/jaudio/file_seq.c
+index f834cd3..88faf4a 100644
+--- a/src/jaudio/file_seq.c
++++ b/src/jaudio/file_seq.c
+@@ -1,4 +1,5 @@
+ #include "jaudio/file_seq.h"
++#include "Dolphin/os.h"
+ 
+ #include "jaudio/jammain_2.h"
+ #include "jaudio/seqsetup.h"
+@@ -179,6 +180,24 @@ void Jaf_GetJamHandle(u32)
+  */
+ seqp_* Jaf_HandleToSeq(u32 index)
+ {
++#if defined(TARGET_PC)
++	// PC: callers pass bgm[].trackHandle, an s8 whose "no track" value is -1.
++	// Widened into a u32 index that is 0xFFFFFFFF, and on GC the 32-bit pointer
++	// arithmetic wrapped it back to &rootseq[-1] — scribbling just below the
++	// array, but never faulting. On LP64 it zero-extends into a multi-gigabyte
++	// offset and the first deref dies (0x0000050105296048 via Jam_MuteTrack).
++	// -1 is the documented no-track sentinel (see Jaf_StopSeq), so report it
++	// once and answer "no track" rather than reproduce the corruption.
++	if (index >= ROOTSEQ_SIZE) {
++		static BOOL reported;
++		if (!reported) {
++			reported = TRUE;
++			OSReport("[JAUDIO] Jaf_HandleToSeq: handle %d out of range (0..%d) — treating as no track\n", (int)index,
++			         ROOTSEQ_SIZE - 1);
++		}
++		return NULL;
++	}
++#endif
+ 	return &rootseq[index];
+ }
+ 
+@@ -194,17 +213,21 @@ void Jaf_LoadStartFinish(u32)
+ /**
+  * @TODO: Documentation
+  */
+-static void Jaf_LoadFinish(u32 param_1)
++static void Jaf_LoadFinish(uintptr_t param_1)
+ {
+-	// Why is a (known) u32 parameter suddenly a pointer?
+-	seq_loadbuffer[*(int*)(param_1 + 4)] = *(u8**)(param_1 + 12);
+-	*(u8*)param_1                        = 0;
++	// The "(known) u32 parameter" the original comment puzzled over is in fact
++	// the &as[index] handed to JV_LoadFile_Async2 as the owner. PC: read it
++	// through as_struct rather than at raw offsets +4/+12 — _0C is a pointer,
++	// so on LP64 it sits at 16, not 12, and the old arithmetic read padding.
++	as_struct* entry              = (as_struct*)param_1;
++	seq_loadbuffer[entry->_04]    = entry->_0C;
++	entry->_00                    = 0;
+ }
+ 
+ /**
+  * @TODO: Documentation
+  */
+-u32 __LoadSeqA(u32 param_1, u32 param_2, u8* param_3, void (*param_4)(u32))
++u32 __LoadSeqA(u32 param_1, u32 param_2, u8* param_3, void (*param_4)(uintptr_t))
+ {
+ 	u32* REF_param_1 = &param_1;
+ 	u32* REF_param_2 = &param_2;
+@@ -244,7 +267,7 @@ u32 __LoadSeqA(u32 param_1, u32 param_2, u8* param_3, void (*param_4)(u32))
+ 	as[index]._08 = param_1;
+ 
+ 	seq_loadbuffer[param_2] = (u8*)1;
+-	return JV_LoadFile_Async2(val1, param_3, 0, seqSize, param_4, (u32)&as[index]);
++	return JV_LoadFile_Async2(val1, param_3, 0, seqSize, param_4, (uintptr_t)&as[index]);
+ }
+ 
+ /**
+diff --git a/src/jaudio/heapctrl.c b/src/jaudio/heapctrl.c
+index b13002a..f9b8219 100644
+--- a/src/jaudio/heapctrl.c
++++ b/src/jaudio/heapctrl.c
+@@ -1,4 +1,6 @@
+ #include "jaudio/heapctrl.h"
++#include "jaudio/pc_dsp.h"
++#include <stdlib.h>
+ 
+ #include "jaudio/dummyrom.h"
+ 
+@@ -6,6 +8,9 @@
+ #include "Dolphin/OS/OSMessage.h"
+ #include "Dolphin/ar.h"
+ #include <stddef.h>
++#if defined(TARGET_PC)
++static int pc_aram_log(void) { static int v = -1; if (v < 0) v = getenv("PC_ARAM_LOG") ? 1 : 0; return v; }
++#endif
+ 
+ #define DMABUFFER_SIZE (0x10000)
+ static u8 dmabuffer[DMABUFFER_SIZE] ATTRIBUTE_ALIGN(32);
+@@ -15,10 +20,10 @@ static u32 global_id = 0;
+ /**
+  * @TODO: Documentation
+  */
+-static void ARAMFinish(u32 msg)
++static void ARAMFinish(uintptr_t msg)
+ {
+ 	STACK_PAD_VAR(1);
+-	u32* REF_param_1;
++	uintptr_t* REF_param_1;
+ 
+ 	REF_param_1         = &msg;
+ 	ARQRequest* request = (ARQRequest*)msg;
+@@ -39,9 +44,9 @@ static void ARAM_TO_ARAM_DMA(u32 src, u32 dst, u32 totalSize)
+ 	while (totalSize != 0) {
+ 		burstSize = totalSize >= DMABUFFER_SIZE ? DMABUFFER_SIZE : totalSize;
+ 
+-		ARQPostRequest(&request, (u32)&msgQueue, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_LOW, src, (u32)dmabuffer, burstSize, &ARAMFinish);
++		ARQPostRequest(&request, (uintptr_t)&msgQueue, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_LOW, src, (uintptr_t)dmabuffer, burstSize, &ARAMFinish);
+ 		OSReceiveMessage(&msgQueue, NULL, OS_MESSAGE_BLOCK);
+-		ARQPostRequest(&request, (u32)&msgQueue, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_LOW, (u32)dmabuffer, dst, burstSize, &ARAMFinish);
++		ARQPostRequest(&request, (uintptr_t)&msgQueue, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_LOW, (uintptr_t)dmabuffer, dst, burstSize, &ARAMFinish);
+ 		OSReceiveMessage(&msgQueue, NULL, OS_MESSAGE_BLOCK);
+ 
+ 		totalSize -= burstSize;
+@@ -61,16 +66,22 @@ static void DRAM_TO_DRAM_DMA(u32 src, u32 dst, u32 totalSize)
+ 	u32 dma_buffer_top;
+ 	u32 burstSize;
+ 
+-	dma_buffer_top = (u32)JAC_ARAM_DMA_BUFFER_TOP;
++	dma_buffer_top = (uintptr_t)JAC_ARAM_DMA_BUFFER_TOP;
+ 	OSInitMessageQueue(&msgQueue, &msg, 1);
+-	DCFlushRange((void*)src, totalSize);
+-	DCInvalidateRange((void*)dst, totalSize);
++	// PC: DEAD PATH on this build. src/dst are jaheap_ startAddresses, and
++	// Jac_Compact_Heap only reaches here for memoryType 1 (DRAM). The single
++	// mother heap in the tree is created ARAM-typed (aramcall.c:102, memType
++	// 0), so memoryType is 0 everywhere and this branch never runs. Were it
++	// ever to run, these would be GC MRAM addresses in a u32 — a real LP64
++	// problem, not a cast to paper over. Kept type-honest, not fixed.
++	DCFlushRange(PC_INT_AS_PTR(void*, src), totalSize);
++	DCInvalidateRange(PC_INT_AS_PTR(void*, dst), totalSize);
+ 	while (totalSize != 0) {
+ 		burstSize = totalSize >= DMABUFFER_SIZE ? DMABUFFER_SIZE : totalSize;
+ 
+-		ARQPostRequest(&request, (u32)&msgQueue, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_LOW, src, dma_buffer_top, burstSize, &ARAMFinish);
++		ARQPostRequest(&request, (uintptr_t)&msgQueue, ARQ_TYPE_MRAM_TO_ARAM, ARQ_PRIORITY_LOW, src, dma_buffer_top, burstSize, &ARAMFinish);
+ 		OSReceiveMessage(&msgQueue, NULL, OS_MESSAGE_BLOCK);
+-		ARQPostRequest(&request, (u32)&msgQueue, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_LOW, dma_buffer_top, dst, burstSize, &ARAMFinish);
++		ARQPostRequest(&request, (uintptr_t)&msgQueue, ARQ_TYPE_ARAM_TO_MRAM, ARQ_PRIORITY_LOW, dma_buffer_top, dst, burstSize, &ARAMFinish);
+ 		OSReceiveMessage(&msgQueue, NULL, OS_MESSAGE_BLOCK);
+ 
+ 		totalSize -= burstSize;
+@@ -296,6 +307,11 @@ BOOL Jac_AllocHeap(jaheap_* heap, jaheap_* parent, u32 size)
+ 			}
+ 		}
+ 
++		// Census -Wconditional-uninitialized (`t`): AUDITED NON-BUG. `t` is
++		// assigned only in the `x < max` block of the free-list walk above —
++		// but so is `result`, and the `if (result == 0) return FALSE;` just
++		// above this point is therefore an exact test for "was `t` assigned".
++		// Correlated guard.
+ 		heap->startAddress = t;
+ 		heap->size         = fixedSize;
+ 		heap->usedSize     = 0;
+@@ -470,6 +486,11 @@ void Jac_GarbageCollection_St(jaheap_* heap)
+ 			case 0:
+ 			{
+ 				ARAM_TO_ARAM_DMA(src, dst, heap_00->size);
++#if defined(TARGET_PC)
++				// The samples just moved. Voices playing out of them must move
++				// too, or they read whatever loads into the old address next.
++				pc_dsp_relocate_voices_in_aram(src, dst, heap_00->size);
++#endif
+ 				break;
+ 			}
+ 			case 1:
+@@ -478,6 +499,17 @@ void Jac_GarbageCollection_St(jaheap_* heap)
+ 				break;
+ 			}
+ 			}
++#if defined(TARGET_PC)
++			// PC_ARAM_LOG=1: compaction MOVES loaded sample data in ARAM.
++			// Voices already playing keep their old baseAddress/currentAramAddr
++			// and are NOT fixed up here, so after a move they read whatever
++			// slid into that address. pc_dsp_stop_voices_in_aram only covers
++			// the FREED region, not moved ones.
++			if (pc_aram_log()) {
++				OSReport("[COMPACT] move 0x%08x -> 0x%08x len 0x%x (delta -0x%x)\n", src, dst,
++				         heap_00->size, src - dst);
++			}
++#endif
+ 			Jac_Move_Children(heap_00, dst - heap_00->startAddress);
+ 			heap_00->startAddress = dst;
+ 		}
+@@ -516,7 +548,7 @@ void Jac_ShowHeap(jaheap_* heap, u32 flag)
+ 
+ 	STACK_PAD_VAR(3);
+ 	char unused[] = "        ";
+-	(void*)unused[0];
++	PC_INT_AS_PTR(void*, unused[0]); // fakematch: a discarded expression either way
+ 
+ 	c     = heap->firstChild;
+ 	REF_c = &c;
+diff --git a/src/jaudio/hvqm_play.c b/src/jaudio/hvqm_play.c
+index c339ec4..0a3c16c 100644
+--- a/src/jaudio/hvqm_play.c
++++ b/src/jaudio/hvqm_play.c
+@@ -1,4 +1,30 @@
+ #include "jaudio/hvqm_play.h"
++#include "pc_uninit.h"
++
++#if defined(TARGET_PC)
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++// pic_ctrl[] is shared between the HVQM playback thread (CheckDraw / Decode1)
++// and the main thread (Jac_GetPicture). On hardware those interleave
++// cooperatively and OSDisableInterrupts covers the critical sections; our
++// OSDisableInterrupts is a no-op and the two really do run at once, so
++// CheckDraw could pass and Decode1 then find the slot taken.
++//
++// The lock is deliberately NOT held across the decode itself — that would stall
++// the render thread for a whole frame. Decode1 only needs the check and the
++// claim to be atomic, so it reserves the slot (state 3) under the lock, decodes
++// outside it, then publishes under the lock again. Jac_GetPicture treats a
++// reserved slot as busy and must not recycle it.
++#define PIC_STATE_RESERVED 3
++static pthread_mutex_t pic_lock = PTHREAD_MUTEX_INITIALIZER;
++#define PIC_LOCK()   pthread_mutex_lock(&pic_lock)
++#define PIC_UNLOCK() pthread_mutex_unlock(&pic_lock)
++#else
++#define PIC_LOCK()
++#define PIC_UNLOCK()
++#endif
+ #include "Dolphin/os.h"
+ #include "hvqm4.h"
+ #include "jaudio/dspbuf.h"
+@@ -79,6 +105,31 @@ typedef struct HVQM_FileHeader {
+ 
+ static HVQM_FileHeader file_header;
+ static u32 gop_header[5]; // TODO: struct?
++
++#if defined(TARGET_PC)
++// PC: EVERY header in a .h4m is read by overlaying a struct straight on the
++// file bytes, and the file is big-endian. There are four of them — the file
++// header, the per-GOP header, the per-record header and the 4-byte video frame
++// header — and each is normalised at the point it enters the system, the same
++// way BARC and the .stx StreamHeader_ are.
++//
++// Verified against the real cntA_S.h4m bytes:
++//     _10 = 0x00000044  header size 68     (matches the arcoffset += 0x44)
++//     _30 = 0x002f47bc  mFileSize
++//     _34 = 0x0280 01e0 mInfo 640 x 480
++//     _40 = 0x00007d00  mSampleRate 32000
++//     _3C = 0x05        mAudioFormat = AUDIOFRMT_ADPCM4X
++// Read natively the decoder is handed width 0x8002 and a 8,384,512 Hz sample
++// rate, so nothing downstream can work. mAudioFormat is a u8 and needs no swap.
++static void pc_swap_file_header(HVQM_FileHeader* h)
++{
++	h->mTotalFrames = __builtin_bswap32(h->mTotalFrames);
++	h->mFileSize    = __builtin_bswap32(h->mFileSize);
++	h->mSampleRate  = __builtin_bswap32(h->mSampleRate);
++	h->mInfo.width  = __builtin_bswap16(h->mInfo.width);
++	h->mInfo.height = __builtin_bswap16(h->mInfo.height);
++}
++#endif
+ static OSThread jac_hvqmThread;
+ static u8 hvqmStack[0x1000] ATTRIBUTE_ALIGN(32);
+ 
+@@ -108,7 +159,7 @@ static void __ReLoad()
+ 		dvd_active += 1;
+ 
+ 		int num_bufs = 3;
+-		DVDT_LoadtoDRAM(dvdcount, filename, (u32)dvd_buf[dvdcount % num_bufs], dvdcount << 0x13, dvdload_size, NULL, __LoadFin);
++		DVDT_LoadtoDRAM(dvdcount, filename, (uintptr_t)dvd_buf[dvdcount % num_bufs], dvdcount << 0x13, dvdload_size, NULL, __LoadFin);
+ 		OSRestoreInterrupts(inter);
+ 	}
+ }
+@@ -116,7 +167,7 @@ static void __ReLoad()
+ /**
+  * @TODO: Documentation
+  */
+-static void __LoadFin(u32 a)
++static void __LoadFin(uintptr_t a)
+ {
+ 	dvd_active--;
+ 
+@@ -176,6 +227,15 @@ static int __VirtualLoad(u32 currentOffs, u32 bytesToRead, u8* data)
+  */
+ static void InitAudio1(StreamHeader_* header, u8* data, u32 size)
+ {
++	// NOTE (M6): the 0x40000 interleave ring cannot hold two audio records —
++	// cntA_S.h4m opens with a 196608-byte one — so the record loop parks on the
++	// second until the first drains. That is by design and is FINE: measured
++	// identical playback (gop 42/43, 1289 frames, 42 ring sends) with this stock
++	// size and with a 1.5 MB one. An earlier pass enlarged it believing the ring
++	// was the stall; it was not, and the enlargement was reverted rather than
++	// left in as a divergence that does nothing. The actual stall was a retry
++	// re-reading a record whose DVD buffer had been retired — see the vh_state
++	// note in Jac_HVQM_Update.
+ 	Jac_InitStreamData(data, size);
+ 	StreamAudio_Start(0, 0, NULL, TRUE, FALSE, header);
+ }
+@@ -234,7 +294,7 @@ void Jac_HVQM_Init(immut char* movieFilePath, u8* data, u32 bufferSize)
+ 	dvdfile_size   = DVDT_CheckFile(movieFilePath);
+ 	dvdfile_size -= 0x80000;
+ 	volatile u32 status;
+-	DVDT_LoadtoDRAM(dvdcount, movieFilePath, (u32)dvd_buf[dvdcount % 3], 0, 0x80000, (u32*)&status, 0);
++	DVDT_LoadtoDRAM(dvdcount, movieFilePath, (uintptr_t)dvd_buf[dvdcount % 3], 0, 0x80000, (u32*)&status, 0);
+ 	while (status == 0) { }
+ 
+ 	dvd_ctrl[0].mFileOffset = 0;
+@@ -245,6 +305,11 @@ void Jac_HVQM_Init(immut char* movieFilePath, u8* data, u32 bufferSize)
+ 	__ReLoad();
+ 
+ 	file_header = *(HVQM_FileHeader*)dvd_buf[0];
++#if defined(TARGET_PC)
++	pc_swap_file_header(&file_header);
++	OSReport("[HVQM] %s: %ux%u, %u frames, audio fmt %u @ %u Hz\n", movieFilePath, file_header.mInfo.width,
++	         file_header.mInfo.height, file_header.mTotalFrames, file_header.mAudioFormat, file_header.mSampleRate);
++#endif
+ 
+ 	arcoffset += 0x44;
+ 	gop_baseframe = 0;
+@@ -354,6 +419,10 @@ static void* hvqm_proc(void* data)
+ 	// appears next in the linker map.  Other context clues tell us that this is an `OSThreadStartFunction`
+ 	// type of function.  Beyond that, it's anyone's guess what this function actually did.
+ 	OSInitFastCast();
++	// PC: TRAP_UNIMPLEMENTED_RET does not fit here — the trap is not the last
++	// statement. An OSThreadStartFunction's return is what OSJoinThread hands
++	// back; NULL is the conventional "nothing". UNUSED either way.
++	return nullptr;
+ }
+ 
+ /**
+@@ -391,20 +460,74 @@ BOOL Jac_HVQM_Update(void)
+ 	}
+ 
+ 	u32 i = 0;
+-	int time_delta;
++	// PC: 0, not indeterminate. time_delta is assigned only on the vh_state == 2
++	// decode pass but read below on every pass, gating the "this decode was slow,
++	// only do one record" brake. PC_UNINIT_PROBE measured 1 hit per movie — the
++	// first pass, with i == 0, which is exactly the case the condition tests.
++	// Zero is what -ftrivial-auto-var-init=zero already supplies AND the correct
++	// answer for a pass in which nothing was decoded.
++	int time_delta = 0;
++#if defined(TARGET_PC)
++	// Census -Wconditional-uninitialized (`time_delta`): probe scaffolding.
++	// time_delta is set only on the vh_state==2 (decode) pass, but read below on
++	// every pass, where it gates the "this decode was slow, stop after one
++	// record" break. A vh_state 0 or 1 pass therefore tests the zero that
++	// -ftrivial-auto-var-init leaves, i.e. the frame-drop brake never engages.
++	// The flag exists only to measure that; it changes no value and no branch.
++	int pc_td_set = 0;
++#endif
+ 	while (TRUE) {
+ 		if (gop_subframe == -1) {
+ 			if (__VirtualLoad(arcoffset, sizeof(gop_header), (u8*)gop_header) == 0) {
+ 				return FALSE;
+ 			}
++#if defined(TARGET_PC)
++			for (u32 g = 0; g < sizeof(gop_header) / sizeof(gop_header[0]); g++) {
++				gop_header[g] = __builtin_bswap32(gop_header[g]);
++			}
++#endif
+ 			arcoffset += 0x14;
+ 			gop_subframe++;
+ 		}
+ 
++#if defined(TARGET_PC)
++		if (getenv("PC_MOVIE_TRACE")) {
++			static int t;
++			if ((t++ % 400) == 0) {
++				OSReport("[HVQM] fw=%d PIC_FRAME=%u gop=%d/%u sub=%d | arcoffset=%u | dvd: count=%u active=%u fin=%d "
++				         "states=[%d %d %d] offs=[%d %d %d] sizes=[%d %d %d] fileLeft=%u\n",
++				         playback_first_wait, PIC_FRAME, gop_frame, file_header.mTotalFrames, gop_subframe, arcoffset,
++				         dvdcount, dvd_active, dvd_loadfinish, dvd_ctrl[0].mState, dvd_ctrl[1].mState,
++				         dvd_ctrl[2].mState, dvd_ctrl[0].mFileOffset, dvd_ctrl[1].mFileOffset, dvd_ctrl[2].mFileOffset,
++				         dvd_ctrl[0].mLoadedSize, dvd_ctrl[1].mLoadedSize, dvd_ctrl[2].mLoadedSize, dvdfile_size);
++			}
++		}
++#endif
+ 		if (record_ok != 0) {
+ 			if (__VirtualLoad(arcoffset, sizeof(rec_header), (u8*)&rec_header) == 0) {
+ 				return 0;
+ 			}
++#if defined(TARGET_PC)
++			rec_header.mRecordType = __builtin_bswap16(rec_header.mRecordType);
++			rec_header.mFrameFlags = __builtin_bswap16(rec_header.mFrameFlags);
++			rec_header.mDataSize   = __builtin_bswap32(rec_header.mDataSize);
++			if (getenv("PC_MOVIE_TRACE")) {
++				static int nrec, stopped;
++				if (!stopped) {
++					const int bad = (rec_header.mRecordType > 1 || rec_header.mDataSize == 0
++					                 || rec_header.mDataSize > (1u << 20));
++					if (bad || nrec < 6) {
++						OSReport("[REC] #%d arcoffset=%u type=%u flags=0x%04x size=%u gop=%d sub=%d%s\n", nrec,
++						         arcoffset - 8, rec_header.mRecordType, rec_header.mFrameFlags, rec_header.mDataSize,
++						         gop_frame, gop_subframe, bad ? "   <== ANOMALY" : "");
++					}
++					if (bad) {
++						stopped = 1;
++					}
++					nrec++;
++				}
++			}
++#endif
+ 			arcoffset += 8;
+ 		}
+ 
+@@ -415,6 +538,20 @@ BOOL Jac_HVQM_Update(void)
+ 		}
+ 		case 0:
+ 		{
++#if defined(TARGET_PC)
++			if (getenv("PC_MOVIE_TRACE")) {
++				static int nSent, nBlocked, t2;
++				if (Jac_CheckStreamFree(rec_header.mDataSize) == 0) {
++					nBlocked++;
++				} else {
++					nSent++;
++				}
++				if ((t2++ % 200) == 0) {
++					OSReport("[HVQM] audio records: %d sent, %d blocked (size %u)\n", nSent, nBlocked,
++					         rec_header.mDataSize);
++				}
++			}
++#endif
+ 			if (Jac_CheckStreamFree(rec_header.mDataSize) == 0) {
+ 				record_ok = 0;
+ 			} else {
+@@ -438,8 +575,33 @@ BOOL Jac_HVQM_Update(void)
+ 		{
+ 			if (playback_first_wait && PIC_FRAME == PIC_BUFFERS) {
+ 				if (StreamSyncCheckReady(0)) {
++#if defined(TARGET_PC)
++					// StreamSyncPlayAudio only commits — clearing autoStart, which
++					// is what makes the next StreamAudio_Callback actually call
++					// Play_DirectPCM — when the stream is in playbackState 2 AND its
++					// DSP channels exist. Those channels are allocated lazily by the
++					// first StreamAudio_Callback. On hardware that callback has been
++					// running at a fixed cadence since boot, so by the time 24
++					// pictures are primed the channels always exist and the retail
++					// code can safely ignore the result.
++					//
++					// Here the ordering is not guaranteed, and clearing
++					// playback_first_wait after a FAILED start wedges playback for
++					// good: autoStart stays set so audio never begins, the
++					// audio-derived frame number never advances, Jac_GetPicture
++					// therefore never releases a picture slot, and the decoder stops
++					// dead at exactly PIC_BUFFERS frames. Only commit once it really
++					// started; otherwise leave first_wait set and try again next
++					// pass.
++					if (!StreamSyncPlayAudio(1.0f, 0, 0x3fff, 0x3fff)) {
++						record_ok = 0;
++						return FALSE;
++					}
++					playback_first_wait = 0;
++#else
+ 					StreamSyncPlayAudio(1.0f, 0, 0x3fff, 0x3fff);
+ 					playback_first_wait = 0;
++#endif
+ 				} else {
+ 					record_ok = 0;
+ 					return FALSE;
+@@ -449,10 +611,21 @@ BOOL Jac_HVQM_Update(void)
+ 			switch (vh_state) {
+ 			case 0:
+ 			{
++#if defined(TARGET_PC)
++				if (getenv("PC_MOVIE_TRACE")) {
++					static int t7;
++					if ((t7++ % 500) == 0) {
++						OSReport("[VID] vh_state=0 vload(%u,4)=%d\n", arcoffset, __VirtualLoad(arcoffset, 4, (u8*)&v_header));
++					}
++				}
++#endif
+ 				if (__VirtualLoad(arcoffset, 4, (u8*)&v_header) == 0) {
+ 					record_ok = 0;
+ 					goto end;
+ 				}
++#if defined(TARGET_PC)
++				v_header = (int)__builtin_bswap32((u32)v_header);
++#endif
+ 				vh_state += 1;
+ 				// fallthrough
+ 			}
+@@ -467,6 +640,18 @@ BOOL Jac_HVQM_Update(void)
+ 			}
+ 			case 2:
+ 			{
++#if defined(TARGET_PC)
++				if (getenv("PC_MOVIE_TRACE")) {
++					static int t6;
++					if (CheckDraw(v_header + gop_baseframe) == 0 && (t6++ % 900) == 0) {
++						const u32 cdId = v_header + gop_baseframe;
++						const u32 slot = (cdId - pic_ctrl[0].mFrameNumber) % PIC_BUFFERS;
++						OSReport("[VID] STALL CheckDraw(id=%u): base=%u slot=%u state=%u slotFrame=%u AUDIO_FRAME=%u\n",
++						         cdId, pic_ctrl[0].mFrameNumber, slot, pic_ctrl[slot].mBufferState,
++						         pic_ctrl[slot].mFrameNumber, AUDIO_FRAME);
++					}
++				}
++#endif
+ 				if (CheckDraw(v_header + gop_baseframe) == 0) {
+ 					record_ok = 0;
+ 					goto end;
+@@ -476,11 +661,63 @@ BOOL Jac_HVQM_Update(void)
+ 			}
+ 			}
+ 
++#if defined(TARGET_PC)
++			// CONSUME THE RECORD ONLY ONCE IT HAS ACTUALLY BEEN DECODED.
++			//
++			// Decode1 returns -1 when its target picture slot is still occupied.
++			// CheckDraw above tested the very same slot, but pic_ctrl is shared
++			// with the main thread's Jac_GetPicture and nothing here serialises
++			// the two: on hardware they interleave cooperatively and
++			// OSDisableInterrupts covers the gap, whereas our OSDisableInterrupts
++			// is a no-op and the threads genuinely run at once. So the check can
++			// pass and the decode still fail.
++			//
++			// The retail order consumes the record BEFORE decoding, so that
++			// failure silently drops a frame: arcoffset advances but gop_subframe
++			// does not. The stream position and the GOP counter then disagree by
++			// one frame per drop, and a couple of dozen frames later the reader
++			// walks into the next GOP header believing it is a record header —
++			// observed as type=38 size=1349840 at arcoffset 2534088, after which
++			// nothing parses and both audio and video starve. Dropping a P-frame
++			// would also corrupt every later frame that references it, which is
++			// the shape of "motion looks garbled".
++			//
++			// Retry the record instead. vh_state is back at 0 and arcoffset still
++			// points at this record, so the next pass simply re-reads it.
++			int start_time = OSGetTime();
++			u32 dec        = Decode1(data, v_header + gop_baseframe, rec_header.mFrameFlags & 0xff);
++			time_delta     = OSGetTime() - start_time;
++#if defined(TARGET_PC)
++			pc_td_set      = 1;
++#endif
++			if (dec > 1) { // -1 as u32: slot still busy
++				// Resume at vh_state 2 (the CheckDraw gate), NOT at 0. `data`
++				// still holds this record's body, so re-reading it would be
++				// wasted work — and worse, it would re-issue __VirtualLoad at the
++				// SAME arcoffset after the spanning-read path has already retired
++				// the buffer containing that cursor, leaving no state-2 buffer
++				// covering it and stalling the stream outright. That retirement
++				// is load-bearing for throughput (suppressing it starved __ReLoad
++				// and cut playback from 265 frames to 31), so the retry has to
++				// avoid re-reading rather than the buffer avoid being retired.
++				// This is exactly how the retail CheckDraw failure path behaves:
++				// it leaves vh_state at 2.
++				vh_state  = 2;
++				record_ok = 0;
++				goto end;
++			}
++			record_ok = 1;
++			arcoffset += rec_header.mDataSize;
++#else
+ 			record_ok = 1;
+ 			arcoffset += rec_header.mDataSize;
+ 			int start_time = OSGetTime();
+ 			u32 dec        = Decode1(data, v_header + gop_baseframe, rec_header.mFrameFlags & 0xff);
+ 			time_delta     = OSGetTime() - start_time;
++#if defined(TARGET_PC)
++			pc_td_set      = 1;
++#endif
++#endif
+ 			if (dec <= 1) {
+ 				PIC_FRAME++;
+ 				gop_subframe++;
+@@ -505,6 +742,11 @@ BOOL Jac_HVQM_Update(void)
+ 			}
+ 		}
+ 
++#if defined(TARGET_PC)
++		if (!pc_td_set) {
++			PC_UNINIT_HIT("hvqm_play.c:723 time_delta", i);
++		}
++#endif
+ 		if (i == 0 && time_delta >= 500000 && drop_picture_flag == 0) {
+ 			break;
+ 		}
+@@ -549,7 +791,21 @@ void Jac_CountReadyPictures(void)
+ /**
+  * @TODO: Documentation
+  */
++#if defined(TARGET_PC)
++static int Jac_GetPicture_impl(void* data, int* x, int* y);
++
+ int Jac_GetPicture(void* data, int* x, int* y)
++{
++	PIC_LOCK();
++	int r = Jac_GetPicture_impl(data, x, y);
++	PIC_UNLOCK();
++	return r;
++}
++
++static int Jac_GetPicture_impl(void* data, int* x, int* y)
++#else
++int Jac_GetPicture(void* data, int* x, int* y)
++#endif
+ {
+ 	int offset = 0;
+ 	int index  = -1;
+@@ -557,20 +813,58 @@ int Jac_GetPicture(void* data, int* x, int* y)
+ 	*y         = file_header.mInfo.height;
+ 
+ 	if (playback_first_wait) {
++		#if defined(TARGET_PC)
++		// LP64: `data` is a u8** — clearing it through an int* zeroes only the
++		// LOW half, so a pointer written just above (via *(void**)data) survives
++		// as e.g. 0x0000000600000000: non-NULL, and garbage.
++		*(void**)data = NULL;
++#else
+ 		*(int*)data = 0;
++#endif
+ 		return 1;
+ 	}
+ 
+ 	int frame = StreamGetCurrentFrame(0, 2);
+ 	if (frame == -1) {
+ 		hvqm_forcestop();
++		#if defined(TARGET_PC)
++		// LP64: `data` is a u8** — clearing it through an int* zeroes only the
++		// LOW half, so a pointer written just above (via *(void**)data) survives
++		// as e.g. 0x0000000600000000: non-NULL, and garbage.
++		*(void**)data = NULL;
++#else
+ 		*(int*)data = 0;
++#endif
+ 		return -1;
+ 	}
+ 
+ 	AUDIO_FRAME = frame;
+-
++#if defined(TARGET_PC)
++	if (getenv("PC_MOVIE_TRACE")) {
++		static int t5;
++		if (t5++ < 40 || (t5 % 600) == 0) {
++			u32 inUse = 0, minF = 0xFFFFFFFF, maxF = 0;
++			for (u32 q = 0; q < PIC_BUFFERS; q++) {
++				if (pic_ctrl[q].mBufferState) {
++					inUse++;
++					if ((u32)pic_ctrl[q].mFrameNumber < minF) minF = pic_ctrl[q].mFrameNumber;
++					if ((u32)pic_ctrl[q].mFrameNumber > maxF) maxF = pic_ctrl[q].mFrameNumber;
++				}
++			}
++			OSReport("[GETPIC] audioFrame=%d | buffers inUse=%u/%u frameNums %u..%u | PIC_FRAME=%u gop_sub=%d\n", frame,
++			         inUse, PIC_BUFFERS, minF, maxF, PIC_FRAME, gop_subframe);
++		}
++	}
++#endif
+ 	for (u32 i = 0; i < PIC_BUFFERS; i++) {
++#if defined(TARGET_PC)
++		// A reserved slot is being decoded into right now; its mFrameNumber is
++		// still the PREVIOUS frame's, so recycling it here would both free a
++		// buffer in use and hand out a half-decoded picture.
++		if (pic_ctrl[i].mBufferState == PIC_STATE_RESERVED) {
++			continue;
++		}
++#endif
+ 		if (pic_ctrl[i].mBufferState) {
+ 			if (pic_ctrl[i].mFrameNumber <= frame) {
+ 				if (offset < pic_ctrl[i].mFrameNumber) {
+@@ -599,7 +893,14 @@ int Jac_GetPicture(void* data, int* x, int* y)
+ 				pic_ctrl[index].mBufferState = 0;
+ 			}
+ 			if (frame < 3) {
+-				*(int*)data = 0;
++				#if defined(TARGET_PC)
++		// LP64: `data` is a u8** — clearing it through an int* zeroes only the
++		// LOW half, so a pointer written just above (via *(void**)data) survives
++		// as e.g. 0x0000000600000000: non-NULL, and garbage.
++		*(void**)data = NULL;
++#else
++		*(int*)data = 0;
++#endif
+ 			}
+ 			return frame + 1;
+ 		}
+@@ -610,7 +911,14 @@ int Jac_GetPicture(void* data, int* x, int* y)
+ 	if (index != -1) {
+ 		*(void**)data = pic_ctrl[index].mPicBuffer;
+ 		if (frame < 3) {
+-			*(int*)data = 0;
++			#if defined(TARGET_PC)
++		// LP64: `data` is a u8** — clearing it through an int* zeroes only the
++		// LOW half, so a pointer written just above (via *(void**)data) survives
++		// as e.g. 0x0000000600000000: non-NULL, and garbage.
++		*(void**)data = NULL;
++#else
++		*(int*)data = 0;
++#endif
+ 		}
+ 		return offset + 1;
+ 	}
+@@ -618,7 +926,14 @@ int Jac_GetPicture(void* data, int* x, int* y)
+ 	if (gop_frame == file_header.mTotalFrames) {
+ 		StreamSyncStopAudio(0);
+ 	}
+-	*(int*)data = 0;
++	#if defined(TARGET_PC)
++		// LP64: `data` is a u8** — clearing it through an int* zeroes only the
++		// LOW half, so a pointer written just above (via *(void**)data) survives
++		// as e.g. 0x0000000600000000: non-NULL, and garbage.
++		*(void**)data = NULL;
++#else
++		*(int*)data = 0;
++#endif
+ 	return 0;
+ }
+ 
+@@ -651,11 +966,17 @@ static BOOL CheckDraw(u32 id)
+  */
+ static int Decode1(u8* data, u32 frameId, u8 frameType)
+ {
++	PIC_LOCK();
+ 	u32 id    = (frameId - pic_ctrl[0].mFrameNumber) % PIC_BUFFERS;
+ 	void* ref = pic_ctrl[id].mPicBuffer;
+ 	if (pic_ctrl[id].mBufferState) {
++		PIC_UNLOCK();
+ 		return -1;
+ 	}
++#if defined(TARGET_PC)
++	pic_ctrl[id].mBufferState = PIC_STATE_RESERVED; // claim before releasing
++#endif
++	PIC_UNLOCK();
+ 
+ 	switch (frameType) {
+ 	case 0x10: // IPIC chunk
+@@ -697,7 +1018,19 @@ static int Decode1(u8* data, u32 frameId, u8 frameType)
+ 	}
+ 	}
+ 
++#if defined(TARGET_PC)
++	if (getenv("PC_MOVIE_DUMP")) {
++		static int n;
++		if (n < 120) {
++			n++;
++			fprintf(stderr, "[TYPE] frame %u = %s\n", frameId,
++			        frameType == 0x10 ? "I" : (frameType == 0x20 ? "P" : (frameType == 0x30 ? "B" : "?")));
++		}
++	}
++#endif
++	PIC_LOCK();
+ 	pic_ctrl[id].mFrameNumber = frameId;
+ 	pic_ctrl[id].mBufferState = 1;
++	PIC_UNLOCK();
+ 	return 0;
+ }
+diff --git a/src/jaudio/interleave.c b/src/jaudio/interleave.c
+index a01b85e..c63e14f 100644
+--- a/src/jaudio/interleave.c
++++ b/src/jaudio/interleave.c
+@@ -1,5 +1,18 @@
+ #include "jaudio/interleave.h"
+ 
++#if defined(TARGET_PC)
++#include "Dolphin/os.h"
++#include <stdlib.h>
++static int pc_movie_trace(void)
++{
++	static int v = -1;
++	if (v < 0) {
++		v = getenv("PC_MOVIE_TRACE") ? 1 : 0;
++	}
++	return v;
++}
++#endif
++
+ static InterleaveBuffer interleavebuf;
+ static InterleaveBuffer* buf = &interleavebuf;
+ 
+@@ -19,6 +32,12 @@ BOOL Jac_SendStreamData(u8* data, u32 size)
+ 	}
+ 	buf->streamFree -= size;
+ 	buf->streamRemain += size;
++#if defined(TARGET_PC)
++	if (pc_movie_trace()) {
++		OSReport("[RING] send %u -> remain=%u free=%u (bufSize=%u)\n", size, buf->streamRemain, buf->streamFree,
++		         buf->bufSize);
++	}
++#endif
+ 	return TRUE;
+ }
+ 
+@@ -84,4 +103,9 @@ void Jac_InitStreamData(u8* data, u32 size)
+ 	buf->streamRemain = 0;
+ 	buf->streamFree   = size;
+ 	buf->isInit       = TRUE;
++#if defined(TARGET_PC)
++	if (pc_movie_trace()) {
++		OSReport("[RING] init: bufSize=%u data=%p (remain reset to 0)\n", size, (void*)data);
++	}
++#endif
+ }
+diff --git a/src/jaudio/ipldec.c b/src/jaudio/ipldec.c
+index a9b1a1c..fd8931f 100644
+--- a/src/jaudio/ipldec.c
++++ b/src/jaudio/ipldec.c
+@@ -94,7 +94,7 @@ void Jac_IPLDspSec(void)
+  */
+ void Jac_DSPcardDecodeAsync(void* task, void* cmd, DSPCallback callback)
+ {
+-	while (WriteTask(DSPTARGET_IPL, (u32)cmd, task, callback) == NULL) {
++	while (WriteTask(DSPTARGET_IPL, PC_PTR_TO_U32(cmd), task, callback) == NULL) {
+ 		;
+ 	}
+ }
+@@ -105,7 +105,7 @@ void Jac_DSPcardDecodeAsync(void* task, void* cmd, DSPCallback callback)
+  */
+ void Jac_DSPagbDecodeAsync(void* task, void* cmd, DSPCallback callback)
+ {
+-	while (WriteTask(DSPTARGET_AGB, (u32)cmd, task, callback) == NULL) {
++	while (WriteTask(DSPTARGET_AGB, PC_PTR_TO_U32(cmd), task, callback) == NULL) {
+ 		;
+ 	}
+ }
+diff --git a/src/jaudio/jammain_2.c b/src/jaudio/jammain_2.c
+index b624cb4..6732179 100644
+--- a/src/jaudio/jammain_2.c
++++ b/src/jaudio/jammain_2.c
+@@ -1,5 +1,8 @@
+ #include "jaudio/jammain_2.h"
+ 
++#include "jaudio/pc_dsp.h"
++#include <stdlib.h>
++
+ #include "jaudio/bankdrv.h"
+ #include "jaudio/centcalc.h"
+ #include "jaudio/driverinterface.h"
+@@ -10,6 +13,7 @@
+ #include "jaudio/random.h"
+ #include "jaudio/rate.h"
+ #include "jaudio/seqsetup.h"
++#include "pc_uninit.h"
+ 
+ #include "Dolphin/OS/OSError.h"
+ 
+@@ -82,6 +86,21 @@ static u8 __ByteReadOfs(seqp_* track, u32 ofs)
+ 	switch (track->dataSourceMode) {
+ 	case 0:
+ 	{
++#if defined(TARGET_PC)
++		// PC: table reads (LoadTbl) index the sequence data by a value taken
++		// from a sequence register, so a bad register walks straight off the
++		// buffer. pikiseq.arc is ~215 KB total, so anything past 1 MB is
++		// certainly wrong — say so once instead of faulting.
++		if (ofs > (1u << 20)) {
++			static int reported;
++			if (!reported) {
++				reported = 1;
++				OSReport("[SEQ] __ByteReadOfs: offset %u (0x%x) out of range on track 0x%x (seqData %p, pc %u)\n", ofs, ofs,
++				         track->trackId, (void*)track->seqData, track->programCounter);
++			}
++			return 0;
++		}
++#endif
+ 		return track->seqData[ofs];
+ 	}
+ 	case 1:
+@@ -186,6 +205,32 @@ static u32 __32Read(seqp_* track)
+ /**
+  * @TODO: Documentation
+  */
++#if defined(TARGET_PC)
++// PC_VOLTRACE=1: every parentController.volume store — WHEN each track's
++// audible volume recomposes, with the inputs. The menu tracks read 0.5
++// (parent-only) at note time despite own volumes of 0.47..0.99; this names
++// the last store and what it saw.
++static void pc_volstore_trace(seqp_* track, f32 computed, int composed)
++{
++	static int on = -1;
++	if (on < 0) {
++		on = getenv("PC_VOLTRACE") ? 1 : 0;
++	}
++	if (!on) {
++		return;
++	}
++	static u32 n;
++	if (++n > 1500) {
++		return;
++	}
++	OSReport("[VOLSTORE] t=%.2f track=%p %s computed=%f innerVol=%f parentVol=%f -> stored=%f\n", pc_dsp_time(),
++	         (void*)track, composed ? "composed" : "own", (double)computed,
++	         (double)track->timedParam.inner.volume.currentValue,
++	         track->parent ? (double)track->parent->parentController.volume : -1.0,
++	         (double)track->parentController.volume);
++}
++#endif
++
+ static BOOL __ConditionCheck(seqp_* track, u8 param_2)
+ {
+ 	BOOL result;
+@@ -305,6 +350,9 @@ void Jam_WriteTimeParam(seqp_* track, u8 controlByte)
+ 		targetValue = __WordRead(track);
+ 		break;
+ 	}
++	// Census -Wconditional-uninitialized (`targetValue`): AUDITED NON-BUG.
++	// The subject is `controlByte & 0x0C`, whose entire range is {0,4,8,12} —
++	// the four cases above. Exhaustive by masking; clang just does not fold it.
+ 	}
+ 
+ 	// Determine time over which to interpolate the parameter
+@@ -392,6 +440,39 @@ void Jam_WriteRegDirect(seqp_* track, u8 index, u16 value)
+ /**
+  * @TODO: Documentation
+  */
++#if defined(TARGET_PC)
++// PC: URegisterParam_ is a union of `u16 reg[32]` and the named struct, and
++// RegisterParam_::extendedRegs is a u32[4] sitting at offset 0x20 — i.e. it
++// OVERLAYS eight of those 16-bit register slots. On the GameCube's big-endian
++// layout a 32-bit register reads as (reg[n] << 16) | reg[n+1]; read natively on
++// a little-endian host the two halves come back swapped.
++//
++// Measured: with reg[22]=0x0000 and reg[23]=0x147C, the sequencer's table
++// opcode wants offset 0x147C (5244) into a 215 KB sequence, but the native u32
++// read produced 0x147C0000 — 343 MB — and walked off the buffer.
++//
++// Verified against the original PPC (main.dol, Jam_WriteRegParam @ 0x8000FC00):
++// r27 there is a genuine local assigned from Jam_ReadReg32, so the decomp is
++// faithful and this really is a host-layout problem, not a decomp artifact.
++//
++// Assemble the halves explicitly so the value matches hardware on either
++// endianness. Indices 40..43 map to extendedRegs[0..3] = reg[16+2k], reg[17+2k].
++#define JAU_EXT_REG_BASE 16
++
++static u32 pc_read_ext_reg(seqp_* track, u32 idx)
++{
++	const u16* r = &track->regParam.reg[JAU_EXT_REG_BASE + idx * 2];
++	return ((u32)r[0] << 16) | (u32)r[1];
++}
++
++static void pc_write_ext_reg(seqp_* track, u32 idx, u32 value)
++{
++	u16* r = &track->regParam.reg[JAU_EXT_REG_BASE + idx * 2];
++	r[0]   = (u16)(value >> 16);
++	r[1]   = (u16)value;
++}
++#endif
++
+ static u32 LoadTbl(seqp_* track, u32 ofs, u32 idx, u32 param_4)
+ {
+ 	u32 result;
+@@ -424,6 +505,20 @@ static u32 LoadTbl(seqp_* track, u32 ofs, u32 idx, u32 param_4)
+ 		result = __LongReadOfs(track, ofs + idx);
+ 		break;
+ 	}
++	// PC probe: `param_4` is a sequence-data operand (the table opcode's width
++	// selector), not a masked value, so anything outside 4..8 returns the zero
++	// -ftrivial-auto-var-init leaves behind instead of a table entry.
++	default:
++		PC_UNINIT_HIT("jammain_2.c:505 LoadTbl result", param_4);
++		// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++		// already zeroes this variable at its declaration and nothing assigns it on the
++		// path that reaches here, so this writes the value that is already there. It is
++		// present because adding a `default:` label PROMOTES the diagnostic from
++		// -Wconditional-uninitialized (not in the always-on set) to
++		// -Wsometimes-uninitialized (which is), and this branch must not spend the
++		// clean-build property to buy instrumentation.
++		result = 0;
++		break;
+ 	}
+ 	return result;
+ }
+@@ -437,11 +532,26 @@ void Jam_WriteRegParam(seqp_* track, u8 param_2)
+ 
+ 	s16 r30_newRegValue; // r30
+ 	u8 r29_regIdx;       // r29
+-	u16 r28;             // r28
+-	u32 unaff_r27;       // r27
++	// PC: zero-init for the same reason as unaff_r27/unaff_r24 below — the
++	// tail's `track->regParam.param.value = r28` is UNCONDITIONAL, but four
++	// of the r29_regIdx cases (0x20/0x21/0x2E/0x2F, the bankNumber and
++	// basePriority composites) never write r28. On PPC that wrote whatever
++	// the saved register happened to hold; here it is deterministic.
++	u16 r28 = 0;         // r28
++	// NOTE (PC): unaff_r27/unaff_r24 read like decompiler artifacts — registers
++	// used without a visible assignment — but they are FAITHFUL. Checked
++	// against the original PPC (main.dol, this function at .text:0x8000FC00):
++	// `stmw r23, 0x1c(r1)` saves r23-r31 as locals, and the only write to r27
++	// before the LoadTbl call is `mr r27, r3` from Jam_ReadReg32 — exactly what
++	// the C below does. The garbage table offsets once seen here were NOT
++	// uninitialised stack; they were the 32-bit registers reading with swapped
++	// halves on a little-endian host (see pc_read_ext_reg above). Zero-init is
++	// kept only so the tail's unconditional write is deterministic on paths
++	// that genuinely never set them.
++	u32 unaff_r27 = 0;   // r27
+ 	u32 r26;             // r26
+ 	u32 r25;             // r25
+-	u32 unaff_r24;       // r24
++	u32 unaff_r24 = 0;   // r24
+ 	s16 r23_oldRegValue; // r23
+ 
+ 	r26 = param_2 & 0xc;
+@@ -494,6 +604,13 @@ void Jam_WriteRegParam(seqp_* track, u8 param_2)
+ 		r30_newRegValue = -1;
+ 		break;
+ 	}
++	// PC probe: `r26` should land in {0,4,8,12,16} — it is `param_2 & 0x0C`
++	// with 8 remapped to 0x10 on one of the two paths that set it — but it is
++	// also read on a path where NEITHER of those `if`s fired, so the domain
++	// argument is not airtight the way a single mask would be. Measure it.
++	default:
++		PC_UNINIT_HIT("jammain_2.c:600 r30_newRegValue", r26);
++		break;
+ 	}
+ 
+ 	r23_oldRegValue = Jam_ReadRegDirect(track, r29_regIdx);
+@@ -630,7 +747,11 @@ void Jam_WriteRegParam(seqp_* track, u8 param_2)
+ 	case 0x2A:
+ 	case 0x2B:
+ 	{
++#if defined(TARGET_PC)
++		pc_write_ext_reg(track, r29_regIdx - 0x28, unaff_r27);
++#else
+ 		track->regParam.param.extendedRegs[r29_regIdx - 0x28] = unaff_r27;
++#endif
+ 		return;
+ 	}
+ 	default:
+@@ -743,6 +864,7 @@ u32 Jam_ReadRegXY(seqp_* track)
+ /**
+  * @TODO: Documentation
+  */
++
+ u32 Jam_ReadReg32(seqp_* track, u8 index)
+ {
+ 	switch (index) {
+@@ -751,7 +873,11 @@ u32 Jam_ReadReg32(seqp_* track, u8 index)
+ 	case 42:
+ 	case 43:
+ 	{
++#if defined(TARGET_PC)
++		return pc_read_ext_reg(track, index - 40);
++#else
+ 		return track->regParam.param.extendedRegs[index - 40];
++#endif
+ 	}
+ 	case 35:
+ 	{
+@@ -1358,6 +1484,23 @@ static f32 __PanCalc(f32 param_1, f32 param_2, f32 param_3, u8 param_4)
+ 		result = param_1 * (1.0f - param_3) + (param_2 * param_3);
+ 		break;
+ 	}
++	// PC probe, HIGH INTEREST. `param_4` is a panCalcType out of bank data.
++	// Cases 0 and 1 `return` outright, so ONLY case 2 assigns `result` — any
++	// other type returns the zero -ftrivial-auto-var-init left there. This
++	// function computes pan, fxmix and dolby for every track (called from the
++	// UpdateTrack param block and from PanCalc), so a zero return is hard-left
++	// / no-FX rather than a slightly wrong number.
++	default:
++		PC_UNINIT_HIT("jammain_2.c:1463 __PanCalc result", param_4);
++		// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++		// already zeroes this variable at its declaration and nothing assigns it on the
++		// path that reaches here, so this writes the value that is already there. It is
++		// present because adding a `default:` label PROMOTES the diagnostic from
++		// -Wconditional-uninitialized (not in the always-on set) to
++		// -Wsometimes-uninitialized (which is), and this branch must not spend the
++		// clean-build property to buy instrumentation.
++		result = 0.0f;
++		break;
+ 	}
+ 	return result;
+ }
+@@ -1625,12 +1768,23 @@ void Jam_UpdateTrack(seqp_* track, u32 updateFlags)
+ 					unaff_f27 = unaff_f27 * offset;
+ 					break;
+ 				}
++				// Census -Wconditional-uninitialized (`unaff_f30`,
++				// `computedVolume`, `unaff_f29`, `unaff_f28`, `unaff_f27` — 5 of
++				// the 40): AUDITED NON-BUG. Each of these five is assigned only
++				// when its OuterParamFlag bit is in `updateFlags`, and this loop
++				// can multiply one whose bit was clear. But every downstream
++				// WRITE is guarded by that same flag (see the two branches just
++				// below), so the product of an unassigned one is computed and
++				// then discarded. Correlated guard, not a live read.
+ 				}
+ 			}
+ 		}
+ 		if (!track->parent || ((track->flags & 1) != 0)) {
+ 			if (updateVolumeFlag) {
+ 				track->parentController.volume = computedVolume;
++#if defined(TARGET_PC)
++				pc_volstore_trace(track, computedVolume, 0);
++#endif
+ 			}
+ 			if (updatePitchFlag) {
+ 				track->parentController.pitch = unaff_f30;
+@@ -1648,6 +1802,9 @@ void Jam_UpdateTrack(seqp_* track, u32 updateFlags)
+ 			dVar15_3 = track->regParam.param.arguments[4] / 32767.0f;
+ 			if (updateVolumeFlag) {
+ 				track->parentController.volume = track->parent->parentController.volume * computedVolume;
++#if defined(TARGET_PC)
++				pc_volstore_trace(track, computedVolume, 1);
++#endif
+ 			}
+ 			if (updatePitchFlag) {
+ 				track->parentController.pitch = track->parent->parentController.pitch * unaff_f30;
+@@ -1702,6 +1859,13 @@ void Jam_MuteTrack(seqp_* track, u8 param_2)
+ 	u32 i;
+ 	u16 mask;
+ 
++#if defined(TARGET_PC)
++	// Jaf_HandleToSeq now answers NULL for the -1 no-track sentinel.
++	if (!track) {
++		return;
++	}
++#endif
++
+ 	if (track->parent) {
+ 		track->isMuted = track->parent->isMuted | param_2;
+ 		mask           = 1 << (track->trackId & 0xf);
+@@ -2591,7 +2755,7 @@ static u32 Cmd_Printf()
+ 	for (i = 0; i < fmtCount; ++i) {
+ 		fmtParms[i] = __ByteRead(SEQ_P);
+ 		if (fmtFlags[i] == 2) {
+-			fmtParms[i] = (u32)Jam_OfsToAddr(SEQ_P, fmtParms[i]);
++			fmtParms[i] = PC_PTR_TO_U32(Jam_OfsToAddr(SEQ_P, fmtParms[i]));
+ 		} else if (fmtFlags[i] == 5) {
+ 			fmtParms[i] = SEQ_P->trackId;
+ 		} else if (fmtFlags[i] >= 3) {
+@@ -2782,6 +2946,9 @@ u32 Cmd_Process(seqp_* track, u8 cmd, u16 param_3)
+ 			arg = __ExchangeRegisterValue(track, __ByteRead(track));
+ 			break;
+ 		}
++		// Census -Wconditional-uninitialized (`arg`): AUDITED NON-BUG. The
++		// subject is `argTypes & 0x03`, range {0,1,2,3} — all four handled.
++		// Exhaustive by masking.
+ 		}
+ 
+ 		argTypes   = argTypes >> 2;
+@@ -3109,6 +3276,19 @@ try_interrupt:
+ 			}
+ 
+ 			// Handle pitch bend
++			//
++			// Census -Wconditional-uninitialized (`duration`,
++			// `pitchBendTargetKey` — 2 of the 40): BOTH AUDITED NON-BUGS.
++			//
++			// `duration`: assigned on BOTH arms of the `if (cond)` inside the
++			// "loop seems fake, always runs once" `for (j = 0; j < 1; j++)`
++			// above. clang's loop analysis will not prove a one-trip loop runs,
++			// which is what it is complaining about; the assignment is total.
++			//
++			// `pitchBendTargetKey`: assigned under `noteOpcodeFlags >> 5 & 2`,
++			// and read here under `track->noteFlags & 2` where noteFlags was
++			// just set to `noteOpcodeFlags >> 5 & 3`. `(x & 3) & 2` == `x & 2`,
++			// so the guard and the assignment condition are the same predicate.
+ 			if (track->noteFlags & 2) {
+ 				s32 steps = duration;
+ 				if (steps == -1) {
+diff --git a/src/jaudio/memory.c b/src/jaudio/memory.c
+index 3fe6ba3..8e37f60 100644
+--- a/src/jaudio/memory.c
++++ b/src/jaudio/memory.c
+@@ -170,8 +170,8 @@ void Nas_HeapInit(ALHeap* heap, u8* p2, s32 p3)
+ 		heap->current = NULL;
+ 		heap->last    = NULL;
+ 	} else {
+-		length        = p3 - ((u32)p2 & 0x1F);
+-		heap->base    = (u8*)ALIGN_NEXT((u32)p2, 32);
++		length        = p3 - ((uintptr_t)p2 & 0x1F);
++		heap->base    = (u8*)ALIGN_NEXT((uintptr_t)p2, 32);
+ 		heap->current = heap->base;
+ 		heap->length  = length;
+ 		heap->last    = NULL;
+diff --git a/src/jaudio/noteon.c b/src/jaudio/noteon.c
+index 3c9e8a0..9be2a59 100644
+--- a/src/jaudio/noteon.c
++++ b/src/jaudio/noteon.c
+@@ -1,6 +1,13 @@
+ #include "jaudio/noteon.h"
+ 
++#include "Dolphin/os.h"
++#include <stdlib.h>
+ #include "jaudio/audiostruct.h"
++#if defined(TARGET_PC) && defined(__cplusplus)
++extern "C" double pc_dsp_time(void);
++#elif defined(TARGET_PC)
++double pc_dsp_time(void);
++#endif
+ #include "jaudio/connect.h"
+ #include "jaudio/driverinterface.h"
+ #include "jaudio/jammain_2.h"
+@@ -16,6 +23,32 @@ s32 NoteON(seqp_* track, s32 channel, s32 flag1, s32 flag2, s32 playFlag)
+ 		return -1;
+ 	}
+ 
++#if defined(TARGET_PC)
++	// PC_SEQTRACE=1: one line per note-on with the sequencer state that decides
++	// retriggering — the menu static is the SAME note refired every tick, which
++	// only happens when the "wait for my note to finish" check keeps failing.
++	{
++		static int st = -1;
++		if (st < 0) {
++			st = getenv("PC_SEQTRACE") ? 1 : 0;
++		}
++		if (st) {
++			static u32 n;
++			if (++n <= 2000) {
++				jc_* prev = track->channels[channel];
++				u32 p0    = track->programCounter >= 8 ? track->programCounter - 8 : 0;
++				u8* bytes = track->seqData + p0;
++				OSReport("[SEQTRACE] t=%.2f track=%p pc=%u tick=%d ch=%d key=%d dur=%d "
++				         "bytes@%u: %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n",
++				         pc_dsp_time(), (void*)track, (unsigned)track->programCounter, (int)track->tickCounter,
++				         (int)channel, (int)flag1, (int)playFlag, p0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
++				         bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
++				         bytes[14], bytes[15]);
++			}
++		}
++	}
++#endif
++
+ 	if (track->channels[channel]) {
+ 		NoteOFF(track, channel);
+ 	}
+@@ -84,6 +117,31 @@ s32 NoteON(seqp_* track, s32 channel, s32 flag1, s32 flag2, s32 playFlag)
+ 	track->activeSoundIds[channel] = sound->channelId;
+ 	UpdatePanPower_1Shot(sound, track->regParam.param.arguments[0], track->regParam.param.arguments[1], track->regParam.param.arguments[2],
+ 	                     track->regParam.param.arguments[3]);
++#if defined(TARGET_PC)
++	// PC_VOLTRACE=1: the track-side volume factors, per note-on. VOLTRACE in
++	// oneshot.c proved velocity/bank math nominal; specific notes still render
++	// +20 dB over Dolphin, so the suspect is the per-track chain the sequence
++	// drives (these pan-power args, and the track volume applied via
++	// Jam_UpdateTrack).
++	{
++		static int vt2 = -1;
++		if (vt2 < 0) {
++			vt2 = getenv("PC_VOLTRACE") ? 1 : 0;
++		}
++		if (vt2) {
++			static u32 n2;
++			if (++n2 <= 200) {
++				OSReport("[PANTRACE] snd=%08x track=%p args=%f %f %f %f trackVol=%f pauseVol=%f paused=%u pauseStatus=0x%x mgrVol=%f\n",
++				         (u32)a, (void*)track, (double)track->regParam.param.arguments[0],
++				         (double)track->regParam.param.arguments[1], (double)track->regParam.param.arguments[2],
++				         (double)track->regParam.param.arguments[3],
++				         (double)track->timedParam.inner.volume.currentValue,
++				         (double)track->timedParam.inner.pauseVolumeFactor.currentValue, (unsigned)track->isPaused,
++				         (unsigned)track->pauseStatus, (double)track->parentController.volume);
++			}
++		}
++	}
++#endif
+ 
+ 	for (u32 i = 0; i < 2; i++) {
+ 		u32 flag = track->oscillatorRouting[i];
+@@ -132,6 +190,24 @@ s32 NoteOFF_R(seqp_* track, u8 param_2, u16 param_3)
+ 				Stop_1Shot_R(jc, param_3);
+ 			}
+ 		}
++#if defined(TARGET_PC)
++		// PC_NOTEOFF_TRACE=1: a mismatch here means the note-off is SKIPPED
++		// while the track slot is cleared anyway, orphaning the voice — it is
++		// never asked to stop and nothing holds a reference to stop it later.
++		// That is the shape of the menu static: looping voices accumulating
++		// with endRequested == 0.
++		else {
++			static int tr = -1;
++			if (tr < 0) tr = getenv("PC_NOTEOFF_TRACE") ? 1 : 0;
++			if (tr) {
++				static u32 n;
++				if (++n <= 40) {
++					OSReport("[ORPHAN] NoteOFF skipped: jc->channelId=%d activeSoundId=%d slot=%u\n",
++					         (int)jc->channelId, (int)track->activeSoundIds[param_2], (unsigned)param_2);
++				}
++			}
++		}
++#endif
+ 		track->channels[param_2]       = NULL;
+ 		track->activeSoundIds[param_2] = 0;
+ 		return 1;
+diff --git a/src/jaudio/oneshot.c b/src/jaudio/oneshot.c
+index 272d261..98f85d7 100644
+--- a/src/jaudio/oneshot.c
++++ b/src/jaudio/oneshot.c
+@@ -1,4 +1,6 @@
+ #include "jaudio/oneshot.h"
++#include "Dolphin/os.h"
++#include <stdlib.h>
+ #include "jaudio/audiostruct.h"
+ #include "jaudio/bankdrv.h"
+ #include "jaudio/bankread.h"
+@@ -6,7 +8,18 @@
+ #include "jaudio/connect.h"
+ #include "jaudio/driverinterface.h"
+ #include "jaudio/dspdriver.h"
++#include "jaudio/pc_dsp.h"
+ #include "jaudio/rate.h"
++#if defined(TARGET_PC)
++#include <stdio.h>
++#ifdef __cplusplus
++extern "C" u8* pc_aram_base(void);
++extern "C" double pc_dsp_time(void);
++#else
++u8* pc_aram_base(void);
++double pc_dsp_time(void);
++#endif
++#endif
+ #include "jaudio/tables.h"
+ #include "jaudio/waveread.h"
+ #include <stddef.h>
+@@ -15,6 +28,18 @@ static int Jesus1Shot_Update(jc_*, JCSTATUS);
+ 
+ static s16 OSC_REL[] = { 1, 10, 0, 15 };
+ 
++// PC: this overlays the SAME .bx velocity-map bytes as Vmap_, so its fields are
++// big-endian file data. The decomp's own note ("Vmap doesnt work so I have no
++// idea") is the layout ambiguity resolved in bx.h: _04 here is a 32-bit read
++// spanning Vmap_'s mWsysID and mWaveID, which only works if those sit at _04
++// and _06 — which they do.
++typedef struct testPercMap {
++	JAU_INT _00;
++	JAU_INT _04;
++	JAU_F32 _08;
++	JAU_F32 _0C;
++} testPercMap;
++
+ Osc_ PERC_ENV    = { 0, 1.0f, 0, 0, 1.0f, 0 };
+ Osc_ OSC_ENV     = { 0, 1.0f, 0, OSC_REL, 1.0f, 0 };
+ u8 polys_table[] = { 0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32 };
+@@ -217,7 +242,7 @@ static jc_* __Oneshot_Play_Start(jcs_* jcs, jc_* jc, u32 p3)
+ 	jc->noteId         = p3;
+ 	jc->lastNotePlayed = jc->noteId;
+ 	jc->updateCallback = Jesus1Shot_Update;
+-	jc->dspChannel     = AllocDSPchannel(0, (u32)jc);
++	jc->dspChannel     = AllocDSPchannel(0, (uintptr_t)jc);
+ 
+ 	if (jc->dspChannel == NULL) {
+ 		play = CheckLogicalChannel(jc);
+@@ -234,7 +259,7 @@ static jc_* __Oneshot_Play_Start(jcs_* jcs, jc_* jc, u32 p3)
+ 			return NULL;
+ 		}
+ 	} else if (play == FALSE) {
+-		DeAllocDSPchannel(jc->dspChannel, (u32)jc);
++		DeAllocDSPchannel(jc->dspChannel, (uintptr_t)jc);
+ 		jc->dspChannel = NULL;
+ 		List_AddChannelTail(&jcs->freeChannels, jc);
+ 		return NULL;
+@@ -249,7 +274,66 @@ static jc_* __Oneshot_Play_Start(jcs_* jcs, jc_* jc, u32 p3)
+  */
+ static jc_* __Oneshot_GetLogicalChannel(jcs_* jcs, CtrlWave_* wave)
+ {
+-	if (wave && wave->sampleSrcType == 0) {
++	// PC: CtrlWave_ is an ad-hoc overlay of WaveID_, and its `sampleSrcType`
++	// at _0C actually lands inside WaveID_'s INLINE jaheap_ — it is
++	// heap.startAddress, the ARAM address the wave was loaded to (which is why
++	// it is handed straight to chan->chanData, DSP_SetWaveInfo's baseAddress).
++	// Our port moved that heap into a side map (jaheap_ holds six pointers and
++	// cannot stay inline on LP64 — see bx_pc.h), so reading it through this
++	// overlay picks up dead placeholder bytes and always sees 0, i.e. "wave not
++	// resident", and every note is refused. Go through the real heap instead.
++#if defined(TARGET_PC)
++	WaveID_* waveId  = (WaveID_*)wave;
++	u32 waveSrcAddr  = wave ? JAU_HEAP(waveId->heap).startAddress : 0;
++	// PC_ARAM_LOG=1: name each wave at note-on time — its id, the ARAM base
++	// its heap resolves to, and the file offset its Wave_ record claims. The
++	// menu-static voices carry bases no [ARC]/[EXTERN] line ever assigned, so
++	// log the resolution at the point of use.
++	{
++		static int wlog = -1;
++		if (wlog < 0) {
++			wlog = getenv("PC_ARAM_LOG") ? 1 : 0;
++		}
++		if (wlog && wave) {
++			static u32 n;
++			if (++n <= 1000) {
++				OSReport("[WAVEON] t=%.2f id=0x%08x base=0x%08x src=0x%08x len=%d fmt=%u key=%u rate=%.0f loop=%d\n",
++				         pc_dsp_time(), (u32)waveId->id, waveSrcAddr, (u32)(s32)waveId->data->srcAddress,
++				         (int)waveId->data->length, (unsigned)waveId->data->compBlockIdx, (unsigned)waveId->data->key,
++				         (double)waveId->data->sampleRate, (int)(s32)waveId->data->isLooping);
++			}
++		}
++		// PC_WAVE_DUMP=<dir>: write each distinct wave's ARAM bytes out once,
++		// named by base, to diff against the source .aw file offsets.
++		if (wave) {
++			const char* dumpdir = getenv("PC_WAVE_DUMP");
++			if (dumpdir) {
++				static u32 dumped[32];
++				static u32 nDumped;
++				u32 seen = 0;
++				for (u32 k = 0; k < nDumped; k++) {
++					if (dumped[k] == waveSrcAddr) {
++						seen = 1;
++						break;
++					}
++				}
++				if (!seen && nDumped < 32) {
++					dumped[nDumped++] = waveSrcAddr;
++					char path[256];
++					snprintf(path, sizeof(path), "%s/wave_%08x.bin", dumpdir, waveSrcAddr);
++					FILE* fp = fopen(path, "wb");
++					if (fp) {
++						fwrite(pc_aram_base() + waveSrcAddr, 1, (size_t)waveId->data->length, fp);
++						fclose(fp);
++					}
++				}
++			}
++		}
++	}
++#else
++	u32 waveSrcAddr = wave ? wave->sampleSrcType : 0;
++#endif
++	if (wave && waveSrcAddr == 0) {
+ 		return FALSE;
+ 	}
+ 
+@@ -288,8 +372,13 @@ static jc_* __Oneshot_GetLogicalChannel(jcs_* jcs, CtrlWave_* wave)
+ 	}
+ 	Channel_Init(chan);
+ 	if (wave) {
++#if defined(TARGET_PC)
++		chan->waveData        = waveId->data;
++		chan->chanData        = waveSrcAddr;
++#else
+ 		chan->waveData        = (Wave_*)wave->waveAddr;
+ 		chan->chanData        = wave->sampleSrcType;
++#endif
+ 		chan->logicalChanType = 0;
+ 	}
+ 	chan->_18 = 0;
+@@ -776,18 +865,18 @@ u32 One_CheckInstWave(SOUNDID_ sound)
+ 	}
+ 
+ 	// TODO: fix this conversion to something wave-related once we've sorted that out
+-	int* map = (int*)VmapRead(inst, sound.bytes[2], sound.bytes[3]);
++	testPercMap* map = (testPercMap*)VmapRead(inst, sound.bytes[2], sound.bytes[3]); // PC: BE file data, not host ints
+ 	if (map == NULL) {
+ 		return 2;
+ 	}
+ 
+ 	// clearly need something better than map[1]
+-	CtrlGroup_* group = WaveidToWavegroup(map[1], sound.bytes[0]);
++	CtrlGroup_* group = WaveidToWavegroup(map->_04, sound.bytes[0]);
+ 	if (group == NULL) {
+ 		return 3;
+ 	}
+ 
+-	WaveID_* handle = GetSoundHandle(group, map[1]);
++	WaveID_* handle = GetSoundHandle(group, map->_04);
+ 	if (handle == 0) {
+ 		return 4;
+ 	}
+@@ -804,16 +893,37 @@ void Get_CtrlWave(SOUNDID_ sound)
+ 	TRAP_UNIMPLEMENTED;
+ }
+ 
+-typedef struct testPercMap {
+-	int _00; // this clearly should one of the existing structs, but Vmap doesnt work so I have no idea
+-	int _04;
+-	f32 _08;
+-	f32 _0C;
+-} testPercMap;
+ 
+ /**
+  * @TODO: Documentation
+  */
++
++#if defined(TARGET_PC)
++// Diagnostic for the null-lookup family in Play_1shot: PC_SOUND_TRACE=1 logs
++// each distinct (sound id, failing stage) once, so a systematic gap in the
++// loaded wave groups is distinguishable from a one-off.
++#include <stdio.h>
++#include <stdlib.h>
++static int pc_strace(void) { static int v = -1; if (v < 0) v = getenv("PC_SOUND_TRACE") ? 1 : 0; return v; }
++static void pc_snull(const char* stage, SOUNDID_ id)
++{
++	if (!pc_strace()) return;
++	static unsigned seen[256][2];
++	static int n;
++	unsigned key = ((unsigned)id.bytes[0] << 24) | ((unsigned)id.bytes[1] << 16)
++	             | ((unsigned)id.bytes[2] << 8) | (unsigned)id.bytes[3];
++	unsigned sk = (unsigned)(size_t)stage;
++	for (int i = 0; i < n; i++)
++		if (seen[i][0] == key && seen[i][1] == sk) return;
++	if (n < 256) { seen[n][0] = key; seen[n][1] = sk; n++; }
++	fprintf(stderr, "[SNDNULL] %-22s id=%02x.%02x.%02x.%02x\n", stage,
++	        id.bytes[0], id.bytes[1], id.bytes[2], id.bytes[3]);
++	fflush(stderr);
++}
++#else
++#define pc_snull(a, b) ((void)0)
++#endif
++
+ jc_* Play_1shot(jcs_* jcs, SOUNDID_ sound, u32 id)
+ {
+ 	jc_* chan;
+@@ -823,6 +933,15 @@ jc_* Play_1shot(jcs_* jcs, SOUNDID_ sound, u32 id)
+ 
+ 	inst = InstRead(sound.bytes[0], sound.bytes[1]);
+ 	if (inst == NULL) {
++		pc_snull("InstRead", sound);
++		// PC: retail left this block empty — a stripped debug PRINT. But the
++		// code below dereferences `inst` unconditionally, so a null from
++		// InstRead() walks straight into a fault. Verified: with `wave` null,
++		// `wave->data` lands on WaveID_::data at _34 and JauFilePtr::get()
++		// reads it — SIGSEGV at address 0x34 on the audio thread, inside
++		// Play_1shot <- NoteON <- Jam_SeqmainNote. Bail like the `map ==
++		// NULL` check a few lines up already does; NoteON handles a NULL
++		// return (noteon.c:83, `return -1`).
+ 		return NULL;
+ 	}
+ 
+@@ -833,19 +952,71 @@ jc_* Play_1shot(jcs_* jcs, SOUNDID_ sound, u32 id)
+ 
+ 	CtrlGroup_* group = WaveidToWavegroup(map->_04, sound.bytes[0]);
+ 	if (group == NULL) {
++		pc_snull("WaveidToWavegroup", sound);
++		// PC: retail left this block empty — a stripped debug PRINT. But the
++		// code below dereferences `group` unconditionally, so a null from
++		// WaveidToWavegroup() walks straight into a fault. Verified: with `wave` null,
++		// `wave->data` lands on WaveID_::data at _34 and JauFilePtr::get()
++		// reads it — SIGSEGV at address 0x34 on the audio thread, inside
++		// Play_1shot <- NoteON <- Jam_SeqmainNote. Bail like the `map ==
++		// NULL` check a few lines up already does; NoteON handles a NULL
++		// return (noteon.c:83, `return -1`).
+ 		return NULL;
+ 	}
+ 
+ 	wave = GetSoundHandle(group, map->_04);
+ 	if (wave == NULL) {
++		pc_snull("GetSoundHandle", sound);
++		// PC: retail left this block empty — a stripped debug PRINT. But the
++		// code below dereferences `wave` unconditionally, so a null from
++		// GetSoundHandle() walks straight into a fault. Verified: with `wave` null,
++		// `wave->data` lands on WaveID_::data at _34 and JauFilePtr::get()
++		// reads it — SIGSEGV at address 0x34 on the audio thread, inside
++		// Play_1shot <- NoteON <- Jam_SeqmainNote. Bail like the `map ==
++		// NULL` check a few lines up already does; NoteON handles a NULL
++		// return (noteon.c:83, `return -1`).
+ 		return NULL;
+ 	}
+ 
+ 	chan = __Oneshot_GetLogicalChannel(jcs, (CtrlWave_*)wave);
+ 	if (chan == NULL) {
++		pc_snull("GetLogicalChannel", sound);
++		// PC: retail left this block empty — a stripped debug PRINT. But the
++		// code below dereferences `chan` unconditionally, so a null from
++		// __Oneshot_GetLogicalChannel() walks straight into a fault. Verified: with `wave` null,
++		// `wave->data` lands on WaveID_::data at _34 and JauFilePtr::get()
++		// reads it — SIGSEGV at address 0x34 on the audio thread, inside
++		// Play_1shot <- NoteON <- Jam_SeqmainNote. Bail like the `map ==
++		// NULL` check a few lines up already does; NoteON handles a NULL
++		// return (noteon.c:83, `return -1`).
+ 		return NULL;
+ 	}
+ 
++#if defined(TARGET_PC)
++	// PC_VOLTRACE=1: the keymap walk, per note-on. A note resolving to a zone
++	// whose root is octaves away is the menu-static shape — the wave decodes
++	// fine but is transposed into a grind.
++	{
++		static int kt = -1;
++		if (kt < 0) {
++			kt = getenv("PC_VOLTRACE") ? 1 : 0;
++		}
++		if (kt) {
++			static u32 n3;
++			if (++n3 <= 600) {
++				char kb[64];
++				int kn = 0;
++				for (u32 q = 0; q < inst->mKeyRegionCount && q < 8; q++) {
++					kn += snprintf(kb + kn, sizeof(kb) - (size_t)kn, "%u ", (unsigned)inst->mKeyRegions[q]->mBaseKey);
++				}
++				OSReport("[KEYMAP] t=%.2f snd=%02x/%02x/%02x/%02x regions=%u bases=[%s] map04=0x%08x waveRoot=%u\n",
++				         pc_dsp_time(), sound.bytes[0], sound.bytes[1], sound.bytes[2], sound.bytes[3],
++				         (unsigned)inst->mKeyRegionCount, kb, (u32)map->_04, (unsigned)wave->data->key);
++			}
++		}
++	}
++#endif
++
+ 	int val = sound.bytes[2] + 60 - wave->data->key;
+ 	if (val < 0) {
+ 		val = 0;
+@@ -896,6 +1067,31 @@ jc_* Play_1shot(jcs_* jcs, SOUNDID_ sound, u32 id)
+ 	chan->soundId = flag;
+ 
+ 	jc_* newjc = __Oneshot_Play_Start(jcs, chan, id);
++#if defined(TARGET_PC)
++	if (newjc && newjc->dspChannel) {
++		pc_dsp_tag_voice(newjc->dspChannel->buffer_idx, sound.value, newjc->soundId, newjc->note, 'N', newjc);
++	}
++	// PC_VOLTRACE=1: the whole volume/pitch derivation per melodic note-on, to
++	// compare instruments against each other (the menu pads render ~12 dB
++	// hotter relative to the music than Dolphin's mix has them).
++	{
++		static int vt = -1;
++		if (vt < 0) {
++			vt = getenv("PC_VOLTRACE") ? 1 : 0;
++		}
++		if (vt && newjc) {
++			static u32 nvt;
++			if (++nvt <= 200) {
++				OSReport("[VOLTRACE] snd=%02x/%02x/%02x/%02x map08=%f map0C=%f gainMul=%f freqMul=%f rate=%f "
++				         "baseVol=%f curVol=%f basePitch=%f curPitch=%f\n",
++				         sound.bytes[0], sound.bytes[1], sound.bytes[2], sound.bytes[3], (double)map->_08,
++				         (double)map->_0C, (double)inst->mGainMultiplier, (double)inst->mFreqMultiplier,
++				         (double)wave->data->sampleRate, (double)newjc->baseVolume, (double)newjc->currentVolume,
++				         (double)newjc->basePitch, (double)newjc->currentPitch);
++			}
++		}
++	}
++#endif
+ 	if (test) {
+ 		__Oneshot_WavePause(newjc, 1);
+ 	}
+@@ -961,14 +1157,25 @@ jc_* Play_1shot_Perc(jcs_* jcs, SOUNDID_ sound, u32 id)
+ 	}
+ 	chan->panMatrices[2].values[0] = 0.0f;
+ 	chan->panMatrices[3].values[0] = 0.0f;
+-	EffecterInit_Perc(chan, (Pmap_*)perc->mKeyRegions[sound.bytes[2]], flag);
++	EffecterInit_Perc(chan, (Pmap_*)(PercKeymap_*)perc->mKeyRegions[sound.bytes[2]], flag);
+ 	chan->soundId = 0;
+ 
++#if defined(TARGET_PC)
++	{
++		jc_* newjc = __Oneshot_Play_Start(jcs, chan, id);
++		if (newjc && newjc->dspChannel) {
++			pc_dsp_tag_voice(newjc->dspChannel->buffer_idx, sound.value, newjc->soundId, newjc->note, 'P', newjc);
++		}
++		return newjc;
++	}
++#else
+ 	return __Oneshot_Play_Start(jcs, chan, id);
++#endif
+ 
+ 	STACK_PAD_VAR(10);
+ }
+ 
++
+ /**
+  * @TODO: Documentation
+  */
+@@ -1007,7 +1214,17 @@ jc_* Play_1shot_Osc(jcs_* jcs, SOUNDID_ sound, u32 id)
+ 	chan->panMatrices[3].values[0] = 0.0f;
+ 	EffecterInit_Osc(chan);
+ 	chan->soundId = 0;
++#if defined(TARGET_PC)
++	{
++		jc_* newjc = __Oneshot_Play_Start(mgr, chan, ids);
++		if (newjc && newjc->dspChannel) {
++			pc_dsp_tag_voice(newjc->dspChannel->buffer_idx, sound.value, newjc->soundId, newjc->note, 'O', newjc);
++		}
++		return newjc;
++	}
++#else
+ 	return __Oneshot_Play_Start(mgr, chan, ids);
++#endif
+ 
+ 	STACK_PAD_VAR(6);
+ }
+diff --git a/src/jaudio/piki_bgm.c b/src/jaudio/piki_bgm.c
+index 9b26b51..bb99500 100644
+--- a/src/jaudio/piki_bgm.c
++++ b/src/jaudio/piki_bgm.c
+@@ -1,4 +1,5 @@
+ #include "jaudio/piki_bgm.h"
++#include <stdlib.h>
+ 
+ #include "Dolphin/os.h"
+ #include "jaudio/aictrl.h"
+@@ -201,6 +202,7 @@ void Jac_FadeOutBgm(u32 trackNo, u32 fade)
+  */
+ void Jac_StopBgm(u32 id)
+ {
++	if (getenv("PC_DSP_SURVEY")) OSReport("[SCENE] t=%.1fs Jac_StopBgm\n", (double)OSGetTick()/40500000.0);
+ 	if (bgm[id].isActive) {
+ 		Jaf_StopSeq(bgm[id].trackHandle);
+ 		bgm[id].isActive = 0;
+@@ -233,6 +235,7 @@ void Jac_ReadyBgm(u32 id)
+  */
+ void Jac_PlayBgm(u32 trackNo, u32 bgmID)
+ {
++	if (getenv("PC_DSP_SURVEY")) OSReport("[SCENE] t=%.1fs Jac_PlayBgm(track=%u bgm=%u)\n", (double)OSGetTick()/40500000.0, trackNo, bgmID);
+ 	STACK_PAD_VAR(4);
+ 	u32* REF_b = &bgmID;
+ 	u32 check;
+@@ -246,7 +249,7 @@ void Jac_PlayBgm(u32 trackNo, u32 bgmID)
+ 	if (bgmID < 2) {
+ 		bgmID = BGM_Dummy2;
+ 	}
+-	check = (u32)Jaf_CheckSeq(bgmID);
++	check = PC_PTR_TO_U32(Jaf_CheckSeq(bgmID));
+ 	if (check == 0) {
+ 		int* idx = &buffer_mus[lastside];
+ 		if (*idx != -1) {
+@@ -258,7 +261,7 @@ void Jac_PlayBgm(u32 trackNo, u32 bgmID)
+ 		lastside             = 1 - lastside;
+ 	} else if (check == 1) {
+ 		while (check == 1) {
+-			check = (u32)Jaf_CheckSeq(bgmID);
++			check = PC_PTR_TO_U32(Jaf_CheckSeq(bgmID));
+ 		}
+ 	}
+ 
+diff --git a/src/jaudio/piki_scene.c b/src/jaudio/piki_scene.c
+index c93e9f9..beff4f8 100644
+--- a/src/jaudio/piki_scene.c
++++ b/src/jaudio/piki_scene.c
+@@ -1,4 +1,7 @@
+ #include "jaudio/piki_scene.h"
++#include <stdlib.h>
++#include "Dolphin/os.h"
++#include "jaudio/pc_dsp.h"
+ 
+ #include "jaudio/aramcall.h"
+ #include "jaudio/dvdthread.h"
+@@ -79,6 +82,9 @@ static u8 header[] = { 0x00, 0x64, 0x0C, 0x62, 0x00, 0x58, 0xEE, 0x80, 0xBB, 0x8
+  */
+ void Jac_Delete_CurrentBgmWave()
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	Jac_StopBgm(0);
+ 	Jac_StopBgm(1);
+ 	WaveScene_Close(current_bgm, 0);
+@@ -87,10 +93,10 @@ void Jac_Delete_CurrentBgmWave()
+ /**
+  * @TODO: Documentation
+  */
+-static void __Loaded(u32 a)
++static void __Loaded(uintptr_t a)
+ {
+ 	STACK_PAD_VAR(1);
+-	u32* REF_a = &a;
++	uintptr_t* REF_a = &a;
+ 	u32 hi     = a & 0xffff0000;
+ 	a          = a & 0x0000ffff;
+ 
+@@ -141,7 +147,14 @@ BOOL Jac_TellChgMode()
+  */
+ void Jac_SceneSetup(u32 sceneID, u32 stage)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	STACK_PAD_VAR(4);
++	if (getenv("PC_DSP_SURVEY")) {
++		pc_dsp_mark_scene_change();
++		OSReport("[SCENE] t=%.1fs Jac_SceneSetup(scene=%u stage=%u)\n", (double)OSGetTick() / 40500000.0, sceneID, stage);
++	}
+ 	u32* REF_sceneID = &sceneID;
+ 	u32* REF_stage   = &stage;
+ 	static int first = 1;
+@@ -337,6 +350,9 @@ void Jac_SceneSetup(u32 sceneID, u32 stage)
+  */
+ void Jac_SceneExit(u32 nextSceneID, u32 stage)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	int fade;
+ 	int newBgm;
+ 
+@@ -387,6 +403,9 @@ void Jac_SceneExit(u32 nextSceneID, u32 stage)
+  */
+ void Jac_SetStreamLevel(u16 streamLevel, u16 seLevel)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	stream_level    = streamLevel;
+ 	stream_se_level = seLevel;
+ }
+@@ -396,6 +415,9 @@ void Jac_SetStreamLevel(u16 streamLevel, u16 seLevel)
+  */
+ void Jac_UpdateStreamLevel()
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	if (StreamCheckAudioFormat(0) == AUDIOFRMT_ADPCM4X) {
+ 		StreamChgVolume(0, 0x7fff, 0x7fff);
+ 		StreamChgMixLevel(0, stream_level, stream_se_level);
+@@ -438,6 +460,9 @@ static int MovieSync(u32 a1, s32 cmd)
+  */
+ void Jac_InitStreamSystem(void)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	RegisterStreamCallback(MovieSync);
+ }
+ 
+@@ -446,6 +471,9 @@ void Jac_InitStreamSystem(void)
+  */
+ void Jac_StopDemoSound(u32 id)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	if (StreamSyncCheckBusy(0, id) == 1) {
+ 		stop_flag = 1;
+ 	}
+@@ -456,6 +484,9 @@ void Jac_StopDemoSound(u32 id)
+  */
+ void Jac_PrepareDemoSound(u32 id)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	char buffer[64];
+ 	STACK_PAD_VAR(3);
+ 	u32* REF_id = &id;
+@@ -477,6 +508,9 @@ void Jac_PrepareDemoSound(u32 id)
+  */
+ void Jac_StartDemoSound(u32 id)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 
+ 	if (current_prepare != id && StreamSyncCheckBusy(0, id) == 1) {
+ 		stop_ready = 0;
+@@ -499,6 +533,9 @@ void Jac_StartDemoSound(u32 id)
+  */
+ void Jac_CheckReadyDemoSound(u32 a)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	TRAP_UNIMPLEMENTED;
+ }
+ 
+@@ -508,6 +545,9 @@ void Jac_CheckReadyDemoSound(u32 a)
+  */
+ void Jac_StreamSetup(void)
+ {
++#if defined(TARGET_PC)
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 */
++#endif
+ 	TRAP_UNIMPLEMENTED;
+ }
+ 
+diff --git a/src/jaudio/pikidemo.c b/src/jaudio/pikidemo.c
+index 3e32489..452a8f2 100644
+--- a/src/jaudio/pikidemo.c
++++ b/src/jaudio/pikidemo.c
+@@ -187,6 +187,7 @@ static void Jac_DemoCheckFrameCall()
+  */
+ void Jac_DemoEventUnPauseCheck()
+ {
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 (Jam_PauseTrack null-derefs with jaudio uninit) */
+ 	if (event_pause_counter) {
+ 		event_pause_counter--;
+ 
+@@ -366,6 +367,7 @@ void Jac_InitDemoSystem()
+  */
+ void Jac_StartDemo(u32 cinID)
+ {
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 (Jam_PauseTrack null-derefs with jaudio uninit) */
+ 	u32* REF_id        = &cinID;
+ 	DemoStatus* status = &DEMO_STATUS[cinID];
+ 	if (cinID >= DEMOID_CHECK_BGM_CAT) {
+@@ -904,7 +906,7 @@ void Jac_FinishDemo_NoErase()
+ /**
+  * @TODO: Documentation
+  */
+-void __Loaded(u32 a)
++void __Loaded(uintptr_t a)
+ {
+ 	if ((int)(a & 0xFFFF0000) < -0x7fffffff) {
+ 		now_loading = 3;
+@@ -916,7 +918,26 @@ void __Loaded(u32 a)
+  */
+ void __Prepare_BGM(u32 cinID)
+ {
+-	int set;
++	// PC: MUST be initialised, and TRUE specifically.
++	//
++	// The `switch (flag & 0xf)` below has cases 0,1,5,6,7,8,9,10 and NO
++	// default, so an audio config whose low nibble is 2, 3 or 4 leaves `set`
++	// untouched and the `if (set == FALSE)` underneath reads it uninitialised.
++	// That is retail's own UB; on PPC it read stack residue, which was
++	// evidently non-zero, so the code fell through to the DVDT_CheckPass at
++	// the end of this function.
++	//
++	// -ftrivial-auto-var-init=zero made that read a deterministic 0 == FALSE,
++	// which takes the `now_loading = 0; return;` path instead. Nothing else
++	// ever raises now_loading again, so the `while (now_loading < 3) { }` in
++	// Jac_StartDemo (pikidemo.c:586) waits forever: a hard hang of the main
++	// thread, not a crash. Observed on the first-Pikmin cutscene —
++	// cinID 9, flag 0x02 — with 100% of samples in that spin.
++	//
++	// TRUE restores the path that worked, and is the safe direction anyway:
++	// it posts the DVDT_CheckPass whose __Loaded callback is the only thing
++	// that can release the wait.
++	int set = TRUE;
+ 	u8 flag;
+ 	DemoStatus* status = &DEMO_STATUS[cinID];
+ 
+@@ -941,6 +962,11 @@ void __Prepare_BGM(u32 cinID)
+ 		}
+ 		default:
+ 		{
++			// PC: nothing is queued on this path, so a caller waiting on now_loading
++			// waits forever. Jac_StartDemo's `while (now_loading < 3)` (pikidemo.c:586)
++			// is that waiter. Signal "prepare complete, nothing to load" — the idiom
++			// the flag&0x80 / flag&0x40 / case-0 exits already use.
++			now_loading = 3;
+ 			return;
+ 		}
+ 		}
+@@ -953,6 +979,11 @@ void __Prepare_BGM(u32 cinID)
+ 	case DEMOID_TakeOffCaveLast:
+ 	case DEMOID_TakeOffYakushima:
+ 	{
++		// PC: nothing is queued on this path, so a caller waiting on now_loading
++		// waits forever. Jac_StartDemo's `while (now_loading < 3)` (pikidemo.c:586)
++		// is that waiter. Signal "prepare complete, nothing to load" — the idiom
++		// the flag&0x80 / flag&0x40 / case-0 exits already use.
++		now_loading = 3;
+ 		return;
+ 	}
+ 	}
+@@ -1021,7 +1052,11 @@ void __Prepare_BGM(u32 cinID)
+ 		}
+ 
+ 		if (set == FALSE) {
+-			now_loading = 0;
++			// PC: the wave scene really did fail, so no DVDT_CheckPass is
++			// posted below and __Loaded will never run. Leaving now_loading
++			// at 0 deadlocks the waiter just as surely as leaving it at 1 —
++			// the spin tests `< 3`, not `!= 0`. Fail forward.
++			now_loading = 3;
+ 			return;
+ 		}
+ 		break;
+@@ -1059,6 +1094,11 @@ void Jac_PrepareDemo(u32 cinID)
+ 		}
+ 		default:
+ 		{
++			// PC: nothing is queued on this path, so a caller waiting on now_loading
++			// waits forever. Jac_StartDemo's `while (now_loading < 3)` (pikidemo.c:586)
++			// is that waiter. Signal "prepare complete, nothing to load" — the idiom
++			// the flag&0x80 / flag&0x40 / case-0 exits already use.
++			now_loading = 3;
+ 			return;
+ 		}
+ 		}
+@@ -1070,6 +1110,11 @@ void Jac_PrepareDemo(u32 cinID)
+ 	case DEMOID_TakeOffCaveLast:
+ 	case DEMOID_TakeOffYakushima:
+ 	{
++		// PC: nothing is queued on this path, so a caller waiting on now_loading
++		// waits forever. Jac_StartDemo's `while (now_loading < 3)` (pikidemo.c:586)
++		// is that waiter. Signal "prepare complete, nothing to load" — the idiom
++		// the flag&0x80 / flag&0x40 / case-0 exits already use.
++		now_loading = 3;
+ 		return;
+ 	}
+ 	}
+@@ -1085,6 +1130,7 @@ void Jac_PrepareDemo(u32 cinID)
+  */
+ void Jac_StartPartsFindDemo(u32 jingleType, BOOL hasAudio)
+ {
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 (Jam_PauseTrack null-derefs with jaudio uninit) */
+ 	STACK_PAD_VAR(2);
+ 	u32* REF_p1;
+ 
+@@ -1138,6 +1184,7 @@ void Jac_FinishPartsFindDemo(void)
+  */
+ void Jac_StartTextDemo(int textID)
+ {
++	if (!pc_audio_enabled()) return; /* PC: audio gated until M5 (Jam_PauseTrack null-derefs with jaudio uninit) */
+ 	if (text_demo_state != 1 && current_demo_no == DEMOID_FINISHED) {
+ 		switch (parts_find_demo_state) {
+ 		case 0:
+diff --git a/src/jaudio/playercall.c b/src/jaudio/playercall.c
+index cdfcde5..43ca758 100644
+--- a/src/jaudio/playercall.c
++++ b/src/jaudio/playercall.c
+@@ -1,4 +1,5 @@
+ #include "jaudio/playercall.h"
++#include "Dolphin/os.h"
+ #include <stddef.h>
+ 
+ static PLAYER_CALL PLAYER_CALLLIST[16];
+diff --git a/src/jaudio/sample.c b/src/jaudio/sample.c
+index 3298e86..cea34f2 100644
+--- a/src/jaudio/sample.c
++++ b/src/jaudio/sample.c
+@@ -76,8 +76,8 @@ void Jac_bcopy(void* src, void* dest, s32 size)
+ 	u8* bsrc  = (u8*)src;
+ 	u8* bdest = (u8*)dest;
+ 
+-	alignedSrc = (reinterpret_cast<u32>(bsrc) & 0x03);
+-	alignedDst = (reinterpret_cast<u32>(bdest) & 0x03);
++	alignedSrc = (reinterpret_cast<uintptr_t>(bsrc) & 0x03);
++	alignedDst = (reinterpret_cast<uintptr_t>(bdest) & 0x03);
+ 	if ((alignedSrc) == (alignedDst) && (size & 0x0f) == 0) {
+ 		Jac_bcopyfast((u32*)src, (u32*)dest, size);
+ 	} else if ((alignedSrc) == (alignedDst) && (size >= 16)) {
+@@ -130,7 +130,7 @@ void Jac_bzero(void* dest, s32 size)
+ {
+ 	u32* udest;
+ 	u8* bdest         = (u8*)dest;
+-	u8 alignedbitsDst = reinterpret_cast<u32>(bdest) & 0x3;
++	u8 alignedbitsDst = reinterpret_cast<uintptr_t>(bdest) & 0x3;
+ 	if (alignedbitsDst == 0) {
+ 		if ((size & 0x1f) == 0) {
+ 			DCZeroRange(dest, size);
+diff --git a/src/jaudio/seqsetup.c b/src/jaudio/seqsetup.c
+index 8dc6d45..b3d895c 100644
+--- a/src/jaudio/seqsetup.c
++++ b/src/jaudio/seqsetup.c
+@@ -1,4 +1,6 @@
+ #include "jaudio/seqsetup.h"
++#include "Dolphin/os.h"
++#include <stdlib.h>
+ 
+ #include "jaudio/driverinterface.h"
+ #include "jaudio/fat.h"
+@@ -7,6 +9,7 @@
+ #include "jaudio/noteon.h"
+ #include "jaudio/oneshot.h"
+ #include "jaudio/playercall.h"
++#include "pc_uninit.h"
+ 
+ #include "Dolphin/OS/OSInterrupt.h"
+ #include <stddef.h>
+@@ -154,7 +157,12 @@ seqp_* Jaq_HandleToSeq(u32 handle)
+ /**
+  * @TODO: Documentation
+  */
+-static void Init_Track(seqp_* track, u32 dataAddress, seqp_* parent)
++// PC: dataAddress is an OVERLOADED slot — a host pointer to the sequence data
++// for a root track, but a program-counter offset for a child. Declared u32 it
++// chopped the root pointer on LP64 and __ByteRead walked off into nothing
++// (0x49e44e60-class addresses). Same shape as the M4 CardUtilCommand::file
++// bug; uintptr_t is identical on the 32-bit target and correct here.
++static void Init_Track(seqp_* track, uintptr_t dataAddress, seqp_* parent)
+ {
+ 	int i;
+ 
+@@ -170,7 +178,7 @@ static void Init_Track(seqp_* track, u32 dataAddress, seqp_* parent)
+ 		track->isMuted          = 0;
+ 	} else {
+ 		track->seqData          = parent->seqData;
+-		track->programCounter   = dataAddress;
++		track->programCounter   = (u32)dataAddress;
+ 		track->fileHandle       = parent->fileHandle;
+ 		track->tempo            = parent->tempo;
+ 		track->needsTempoSync   = FALSE;
+@@ -382,14 +390,29 @@ s32 Jaq_SetSeqData_Limit(seqp_* track, u8* param_2, u32 param_3, u32 param_4, u8
+ 	}
+ 	case 2:
+ 	{
+-		track->fileHandle = (u8)param_2;
++		track->fileHandle = (u8)(uintptr_t)param_2;
+ 		puVar2            = NULL;
+ 		break;
+ 	}
++	// PC probe: `param_4` is the caller's dataSourceMode. It was already stored
++	// into track->dataSourceMode above, so an unhandled mode leaves the track
++	// claiming a source it did not set up, and Init_Track below gets the zero
++	// -ftrivial-auto-var-init left in `puVar2` as its sequence base.
++	default:
++		PC_UNINIT_HIT("seqsetup.c:399 puVar2", param_4);
++		// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++		// already zeroes this variable at its declaration and nothing assigns it on the
++		// path that reaches here, so this writes the value that is already there. It is
++		// present because adding a `default:` label PROMOTES the diagnostic from
++		// -Wconditional-uninitialized (not in the always-on set) to
++		// -Wsometimes-uninitialized (which is), and this branch must not spend the
++		// clean-build property to buy instrumentation.
++		puVar2 = NULL;
++		break;
+ 	}
+ 	track->trackId = root;
+ 	track->flags   = 3;
+-	Init_Track(track, (u32)puVar2, NULL);
++	Init_Track(track, (uintptr_t)puVar2, NULL);
+ 	Jam_InitExtBuffer(&ROOT_OUTER[root]);
+ 	Jam_AssignExtBuffer(track, &ROOT_OUTER[root]);
+ 	Init_1shot(&track->parentController, param_5);
+diff --git a/src/jaudio/syncstream.c b/src/jaudio/syncstream.c
+index 01d5fbe..d71d308 100644
+--- a/src/jaudio/syncstream.c
++++ b/src/jaudio/syncstream.c
+@@ -1,4 +1,19 @@
+ #include "jaudio/syncstream.h"
++
++#if defined(TARGET_PC)
++#include <stdlib.h>
++static int pc_movie_trace(void)
++{
++	static int v = -1;
++	if (v < 0) {
++		v = getenv("PC_MOVIE_TRACE") ? 1 : 0;
++	}
++	return v;
++}
++#endif
++#include "Dolphin/os.h"
++#include "jaudio/pc_dsp.h"
++#include "pc_uninit.h"
+ #include "Dolphin/dvd.h"
+ #include "jaudio/aictrl.h"
+ #include "jaudio/audiostruct.h"
+@@ -55,11 +70,19 @@ void Play_DirectPCM(dspch_* dspch, s16* baseAddr, u16 loopStart, u32 length)
+ {
+ 	DSPchannel_* buff = GetDspHandle(dspch->buffer_idx); // r3
+ 
+-	buff->baseAddress       = (u32)baseAddr;
++	// PC: source type 0x21 is PCM streamed from MAIN MEMORY, so baseAddr is a
++	// host pointer rather than an ARAM offset — it does not survive a u32 on
++	// LP64. baseAddress stays as-is (the VPB's 0x180 stride is verified against
++	// hardware and must not change); the real pointer goes to a side table the
++	// renderer consults for this source type.
++	buff->baseAddress       = PC_PTR_TO_U32(baseAddr);
++#if defined(TARGET_PC)
++	pc_dsp_set_direct_pcm(dspch->buffer_idx, baseAddr);
++#endif
+ 	buff->isLooping         = FALSE;
+-	buff->samplesSourceType = 0x21; // todo: find out what this is
++	buff->samplesSourceType = 0x21; // PCM direct from main memory
+ 	buff->remainingLength   = length;
+-	buff->loopAddress       = (u32)baseAddr;
++	buff->loopAddress       = PC_PTR_TO_U32(baseAddr);
+ 	buff->loopStartPosition = loopStart << 16;
+ 
+ 	DSP_SetMixerInitDelayMax(dspch->buffer_idx, 0);
+@@ -133,7 +156,25 @@ static void LoadADPCM(StreamCtrl_*, int);
+  */
+ static void __LoadFin(s32 size, DVDFileInfo* fileinfo)
+ {
++#if defined(TARGET_PC)
++	// Census -Wconditional-uninitialized (`ctrl`): NULLGUARD — the one site of
++	// the 40 whose fall-through is a null-pointer WRITE, so unlike the rest this
++	// guard does change behavior. `ctrl` is assigned only on a match, and this
++	// is a DVD read-completion callback: an unmatched `fileinfo` (a stream
++	// released while its read was still outstanding is the obvious way in) means
++	// the write below goes through a null. -ftrivial-auto-var-init=zero already
++	// makes that NULL rather than stack residue; the explicit initialiser just
++	// stops the guard depending on that flag staying on.
++	//
++	// Returning leaves isLoadInProgress set, which stalls that stream — strictly
++	// better than the segfault, and only on a path that currently segfaults.
++	// A previously fixed bug had this same shape (`Play_1shot`, SIGSEGV at 0x34
++	// on the audio thread), which is why this one is guarded before it is
++	// measured rather than after.
++	StreamCtrl_* ctrl = NULL;
++#else
+ 	StreamCtrl_* ctrl;
++#endif
+ 
+ 	for (int i = 0; i < ARRAY_SIZE(SC); i++) {
+ 		DVDFileInfo* info = &SC[i].fileinfo;
+@@ -143,6 +184,13 @@ static void __LoadFin(s32 size, DVDFileInfo* fileinfo)
+ 		}
+ 	}
+ 
++#if defined(TARGET_PC)
++	if (!ctrl) {
++		PC_UNINIT_HIT("syncstream.c:168 ctrl (NULLGUARD)", 0);
++		return;
++	}
++#endif
++
+ 	ctrl->isLoadInProgress = FALSE;
+ 
+ 	u32 idx = ctrl->buffCtrlMain.currentBufIdx;
+@@ -212,6 +260,16 @@ static void LoadADPCM(StreamCtrl_* ctrl, int r28)
+ 	}
+ 
+ 	if (!ctrl->isFromFile) {
++#if defined(TARGET_PC)
++		{
++			static int t4;
++			if (pc_movie_trace() && t4++ < 12) {
++				OSReport("[LOADADPCM] ctrl=%p id=%d curBuf=%u chunkSize=%u size=%u remainingBytes=%u streamRemain=%u -> %s\n",
++				         (void*)ctrl, ctrl->streamId, ctrl->buffCtrlMain.currentBufIdx, ctrl->chunkSize, size,
++				         ctrl->remainingBytes, Jac_GetStreamRemain(), Jac_CheckStreamRemain(size) ? "LOAD" : "BLOCKED");
++			}
++		}
++#endif
+ 		if (!Jac_CheckStreamRemain(size)) {
+ 			return;
+ 		}
+@@ -329,6 +387,22 @@ BOOL StreamAudio_Start(u32 ctrlID, int soundId, immut char* name, BOOL r6, BOOL
+ 		}
+ 
+ 		DVDReadPrio(&ctrl->fileinfo, &ctrl->data[0].header, 0x20, 0, 1);
++#if defined(TARGET_PC)
++		// PC: StreamHeader_ is overlaid directly on the .stx file's first 0x20
++		// bytes, which are big-endian. Read natively, fileSize/sampleCount come
++		// back byte-swapped, so remainingBytes and the derived chunk size are
++		// nonsense — observed as a ZERO-length read that __LoadFin then retries
++		// forever (the intro movie's audio, /dataDir/SndData/opening.stx).
++		// Normalise once, here, where the header enters the system.
++		{
++			StreamHeader_* h = &ctrl->data[0].header;
++			h->fileSize      = __builtin_bswap32(h->fileSize);
++			h->sampleCount   = __builtin_bswap32(h->sampleCount);
++			h->sampleRate    = __builtin_bswap16(h->sampleRate);
++			h->audioFormat   = __builtin_bswap16(h->audioFormat);
++			h->frameRate     = __builtin_bswap16(h->frameRate);
++		}
++#endif
+ 		ctrl->header    = ctrl->data[0].header;
+ 		ctrl->bytesRead = 0x20;
+ 	} else {
+@@ -346,7 +420,7 @@ BOOL StreamAudio_Start(u32 ctrlID, int soundId, immut char* name, BOOL r6, BOOL
+ 
+ 	for (i = 0; i < 6; i++) {
+ 		ctrl->buffCtrl[i].state   = 0;
+-		ctrl->buffCtrl[i].mLength = (u32)&ctrl->data[i]; // TODO: should be a pointer?
++		ctrl->buffCtrl[i].mLength = (uintptr_t)&ctrl->data[i]; // PC: it IS a pointer — see BufControl_
+ 	}
+ 
+ 	for (i = 0; i < 2; i++) {
+@@ -387,7 +461,7 @@ BOOL StreamAudio_Start(u32 ctrlID, int soundId, immut char* name, BOOL r6, BOOL
+ 	LoadADPCM(ctrl, 1);
+ 
+ 	for (u32 i = 0; i < 2; i++) {
+-		DeAllocDSPchannel(ctrl->dspch[i], (u32)(&ctrl->dspch[i]));
++		DeAllocDSPchannel(ctrl->dspch[i], (uintptr_t)&ctrl->dspch[i]);
+ 
+ 		ctrl->dspch[i] = 0;
+ 	}
+@@ -421,15 +495,48 @@ static s32 StreamAudio_Callback(void* data)
+ 	int bufferUpdatePending = 0;
+ 	u32 channelIdx;
+ 	STACK_PAD_VAR(2);
++#if defined(TARGET_PC)
++	{
++		static int t3;
++		if (pc_movie_trace() && (t3++ % 900) == 0) {
++			OSReport("[STREAMCB] ctrl=%p #%d: st=%u fc=%u | main cur=%u act=%u states=[%u %u %u %u %u %u] | "
++			         "extra cur=%u act=%u st=[%u %u] | main3 cur=%u act=%u | loaded=%u decoded=%u\n",
++			         (void*)ctrl, t3, ctrl->playbackState, ctrl->frameCounter, ctrl->buffCtrlMain.currentBufIdx,
++			         ctrl->buffCtrlMain.activeBufIdx, ctrl->buffCtrl[0].state, ctrl->buffCtrl[1].state,
++			         ctrl->buffCtrl[2].state, ctrl->buffCtrl[3].state, ctrl->buffCtrl[4].state, ctrl->buffCtrl[5].state,
++			         ctrl->buffCtrlMain2.currentBufIdx, ctrl->buffCtrlMain2.activeBufIdx, ctrl->buffCtrlExtra[0].state,
++			         ctrl->buffCtrlExtra[1].state, ctrl->buffCtrlMain3.currentBufIdx, ctrl->buffCtrlMain3.activeBufIdx,
++			         ctrl->samplesLoaded, ctrl->samplesDecoded);
++		}
++	}
++#endif
+ 
+ 	if (!ctrl->dspch[0]) {
+ 		for (channelIdx = 0; channelIdx < 2; channelIdx++) {
+-			ctrl->dspch[channelIdx] = AllocDSPchannel(0, (u32)&ctrl->dspch[channelIdx]);
+-#if defined(VERSION_GPIP01)
+-			if (ctrl->dspch[channelIdx])
++			ctrl->dspch[channelIdx] = AllocDSPchannel(0, (uintptr_t)&ctrl->dspch[channelIdx]);
++#if defined(VERSION_GPIP01) || defined(TARGET_PC)
++			// PC: the PAL build null-checks this and the US build does not — a
++			// real defect in the retail US code that simply never fired on
++			// hardware, because the DSP channel pool was not exhausted at this
++			// point. Here it is: AllocDSPchannel returns NULL and the write
++			// lands on offset 3 of a null dspch_, which is exactly the
++			// "byte write Translation fault, far=3" in the user's crash dumps.
++			// Take the PAL guard — it is the same codebase's own fix.
++			if (!ctrl->dspch[channelIdx]) {
++				static BOOL reported;
++				if (!reported) {
++					reported = TRUE;
++					OSReport("[JAUDIO] StreamAudio: no free DSP channel for stream %d — skipping (US build would fault here)\n",
++					         ctrl->streamId);
++				}
++			} else
+ #endif
+ 			{
+ 				ctrl->dspch[channelIdx]->prio = DSPCHAN_MAX_PRIO;
++#if defined(TARGET_PC)
++				pc_dsp_tag_voice(ctrl->dspch[channelIdx]->buffer_idx, 0, ctrl->streamId, (u8)channelIdx, 'S',
++				                 &ctrl->dspch[channelIdx]);
++#endif
+ 			}
+ 		}
+ 	}
+@@ -447,7 +554,7 @@ static s32 StreamAudio_Callback(void* data)
+ 
+ 			for (channelIdx = 0; channelIdx < 2; channelIdx++) {
+ 				Stop_DirectPCM(ctrl->dspch[channelIdx]);
+-				DeAllocDSPchannel(ctrl->dspch[channelIdx], (u32)&ctrl->dspch[channelIdx]);
++				DeAllocDSPchannel(ctrl->dspch[channelIdx], (uintptr_t)&ctrl->dspch[channelIdx]);
+ 				ctrl->dspch[channelIdx] = NULL;
+ 			}
+ 
+@@ -894,6 +1001,21 @@ static u32 __Decode(StreamCtrl_* ctrl)
+ 		size = __DecodeADPCM4X(ctrl);
+ 		break;
+ 	}
++	// PC probe: the subject is `ctrl->header.audioFormat` — STREAM FILE DATA —
++	// and note AUDIOFRMT_16BIT_PCM's case is #if'd out for every version but
++	// GPIP01, so on this build a stream declaring 16-bit PCM lands here and
++	// returns zero decoded samples.
++	default:
++		PC_UNINIT_HIT("syncstream.c:979 size", ctrl->header.audioFormat);
++		// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++		// already zeroes this variable at its declaration and nothing assigns it on the
++		// path that reaches here, so this writes the value that is already there. It is
++		// present because adding a `default:` label PROMOTES the diagnostic from
++		// -Wconditional-uninitialized (not in the always-on set) to
++		// -Wsometimes-uninitialized (which is), and this branch must not spend the
++		// clean-build property to buy instrumentation.
++		size = 0;
++		break;
+ 	}
+ 	return size;
+ }
+@@ -1122,6 +1244,18 @@ int StreamGetCurrentFrame(u32 streamId, u32 id2)
+ 	STACK_PAD_VAR(2);
+ 
+ 	if (dspCh == NULL) {
++#if defined(TARGET_PC)
++		{
++			static int once;
++			if (!once) {
++				once = 1;
++				OSReport("[STREAM] GetCurrentFrame(-1): dspch[0] is NULL — state=%u fc=%u autoStart=%d atEnd=%d "
++				         "stopReq=%d streamId=%d\n",
++				         ctrl->playbackState, ctrl->frameCounter, ctrl->autoStart, ctrl->isAtEnd, ctrl->stopRequested,
++				         ctrl->streamId);
++			}
++		}
++#endif
+ 		return -1;
+ 	}
+ 
+@@ -1145,8 +1279,32 @@ int StreamGetCurrentFrame(u32 streamId, u32 id2)
+ 			u32 size = ctrl->totalSamples - Get_DirectPCM_Remain(GetDspHandle(dspCh->buffer_idx));
+ 			result   = size * (f32)ctrl->header.frameRate / ctrl->header.sampleRate + 0.499f;
+ 		}
++#if defined(TARGET_PC)
++		{
++			static int t;
++			if (pc_movie_trace() && (t++ % 400) == 0) {
++				OSReport("[STREAM] frameCounter=%u totalSamples=%u remain=%u rate=%u/%u -> frame=%d\n",
++				         ctrl->frameCounter, ctrl->totalSamples, Get_DirectPCM_Remain(GetDspHandle(dspCh->buffer_idx)),
++				         ctrl->header.frameRate, ctrl->header.sampleRate, result);
++			}
++		}
++#endif
+ 		break;
+ 	}
++	// PC probe: `id2` is the caller's "which frame counter do you want" selector;
++	// anything outside 0..2 reports frame 0, which reads as a stream that never
++	// advances.
++	default:
++		PC_UNINIT_HIT("syncstream.c:1255 result", id2);
++		// The `= 0` is not a fix and not a behavior change: -ftrivial-auto-var-init=zero
++		// already zeroes this variable at its declaration and nothing assigns it on the
++		// path that reaches here, so this writes the value that is already there. It is
++		// present because adding a `default:` label PROMOTES the diagnostic from
++		// -Wconditional-uninitialized (not in the always-on set) to
++		// -Wsometimes-uninitialized (which is), and this branch must not spend the
++		// clean-build property to buy instrumentation.
++		result = 0;
++		break;
+ 	}
+ 
+ 	return result;
+diff --git a/src/jaudio/verysimple.c b/src/jaudio/verysimple.c
+index 95544a9..548fe46 100644
+--- a/src/jaudio/verysimple.c
++++ b/src/jaudio/verysimple.c
+@@ -1,3 +1,4 @@
++#include <stdlib.h>
+ #include "jaudio/verysimple.h"
+ 
+ #include "Dolphin/os.h"
+@@ -384,7 +385,7 @@ void Jac_SetThreadPriority(void)
+ /**
+  * @TODO: Documentation
+  */
+-static void __BootSoundOK(u32)
++static void __BootSoundOK(uintptr_t)
+ {
+ 	boot_ok = TRUE;
+ }
+@@ -402,12 +403,28 @@ BOOL Jac_CheckBootOk()
+  */
+ void Jac_Start(void* heap, u32 heapSize, u32 aramSize, immut char* rootPath)
+ {
++#if defined(TARGET_PC)
++	/* PC: jaudio's archive parsers read big-endian structs via overlay and
++	   the DSP frame renderer doesn't exist yet (M5) — audio is opt-in via
++	   PC_AUDIO=1 until then. */
++	if (!pc_audio_enabled()) {
++		OSReport("[PC] audio disabled (audio.enabled in settings.ini, or PC_AUDIO=1)\n");
++		return;
++	}
++#endif
+ 	STACK_PAD_VAR(1);
+ 
+ 	if (rootPath) {
+ 		DVDT_SetRootPath(rootPath);
+ 	}
+ 	StartAudioThread(heap, heapSize, aramSize, 3);
++#if defined(TARGET_PC)
++	// Wait for audioproc's init before touching anything it initialises — see
++	// the g_pc_jac_audio_ready note in audiothread.c.
++	while (g_pc_jac_audio_ready == 0) {
++		OSYieldThread();
++	}
++#endif
+ 	AuxBusInit();
+ 	Jac_RegisterExtFastOpen("/Seqs/pikiseq.arc");
+ 	Jac_RegisterExtFastOpen("/Banks/demose_0.aw");
+diff --git a/src/jaudio/virload.c b/src/jaudio/virload.c
+index 71d4ae9..1c8c1f2 100644
+--- a/src/jaudio/virload.c
++++ b/src/jaudio/virload.c
+@@ -1,5 +1,6 @@
+ #include "jaudio/virload.h"
+ 
++#include "Dolphin/os.h"
+ #include "jaudio/aictrl.h"
+ #include "jaudio/dvdthread.h"
+ 
+@@ -17,6 +18,59 @@ static Barc* JV_ARC[16]; // Pointers to BARC metadata (*.hed). In practice, just
+ 
+ static u32 JV_CURRENT_ARCS = 0; // TODO: type unknown, init unclear
+ 
++#if defined(TARGET_PC)
++// PC: BARC ("BARC----") is a big-endian disc/DOL blob overlaid directly on
++// `Barc`, so every u32/u16 in it reads byte-reversed on a little-endian host —
++// seqCount 22 becomes 0x16000000, and the entry offsets/sizes turn into the
++// multi-hundred-MB garbage that made JV_LoadFile ask the DVD shim for a
++// 1,076,625,408-byte read. Rather than swapping at each of the handful of
++// read sites, normalise the blob ONCE here, at the single point where it
++// enters the audio system, and let every reader stay unmodified.
++//
++// Layout is fixed at 0x20 bytes per union element: element 0 is the header,
++// elements 1..seqCount are entries. The char fields (fileMagic, arcName,
++// jamName) are byte strings and must NOT be swapped.
++//
++// Same class as the DDF/lpsPos fixes; see the M5 plan's P5 sweep note — the
++// bank/wave loaders parse disc headers the same way and are still unaudited.
++static Barc* JV_SWAPPED[JV_ARC_NAME_LENGTH];
++static u32 JV_SWAPPED_COUNT = 0;
++
++static void JV_SwapBarcOnce(Barc* hed)
++{
++	u32 i;
++	u32 count;
++
++	if (!hed) {
++		return;
++	}
++	// HEAD_pikiseq is a static array: a second Jaf_InitSeqArchive2 on the same
++	// blob would swap it back into garbage.
++	for (i = 0; i < JV_SWAPPED_COUNT; i++) {
++		if (JV_SWAPPED[i] == hed) {
++			return;
++		}
++	}
++	if (JV_SWAPPED_COUNT < JV_ARC_NAME_LENGTH) {
++		JV_SWAPPED[JV_SWAPPED_COUNT++] = hed;
++	}
++
++	hed->meta._04      = __builtin_bswap32(hed->meta._04);
++	hed->meta.seqCount = __builtin_bswap32(hed->meta.seqCount);
++	count              = hed->meta.seqCount;
++
++	for (i = 1; i <= count; i++) {
++		BarcEntry* e = &hed[i].entry;
++		e->isDummy   = __builtin_bswap16(e->isDummy);
++		e->_10       = __builtin_bswap32(e->_10);
++		e->_14       = __builtin_bswap32(e->_14);
++		e->offset    = __builtin_bswap32(e->offset);
++		e->size      = __builtin_bswap32(e->size);
++	}
++	OSReport("[JAUDIO] BARC '%.8s' byte-swapped: %u sequences\n", hed->meta.fileMagic, count);
++}
++#endif
++
+ /**
+  * @TODO: Documentation
+  * @note UNUSED Size: 000028
+@@ -67,8 +121,14 @@ BOOL JV_InitHeader_M(immut char* fileName, u8* barcData, u8* p3)
+ 
+ 	strcpy(JV_ARC_NAME[JV_CURRENT_ARCS], &fileName[len + 1]);
+ 
++#if defined(TARGET_PC)
++	// Before anything reads the blob — and before _04 below is overwritten
++	// with a host value that must NOT be swapped.
++	JV_SwapBarcOnce((Barc*)barcData);
++#endif
++
+ 	JV_ARC[JV_CURRENT_ARCS]           = (Barc*)barcData;
+-	JV_ARC[JV_CURRENT_ARCS]->meta._04 = (u32)p3;
++	JV_ARC[JV_CURRENT_ARCS]->meta._04 = PC_PTR_TO_U32(p3);
+ 
+ 	JV_CURRENT_ARCS++;
+ 	return TRUE;
+@@ -199,7 +259,7 @@ u32 JV_LoadFile(u32 handle, u8* dst, u32 param_3, u32 length)
+ 	strcpy(name, JV_DIR_NAME[idx]);
+ 	strcat(name, "/");
+ 	strcat(name, JV_ARC[idx]->meta.arcName);
+-	DVDT_LoadtoDRAM(0, name, (u32)dst, src, length, (u32*)&status, NULL);
++	DVDT_LoadtoDRAM(0, name, (uintptr_t)dst, src, length, (u32*)&status, NULL);
+ 
+ 	while (status == 0) {
+ 		;
+@@ -212,7 +272,7 @@ u32 JV_LoadFile(u32 handle, u8* dst, u32 param_3, u32 length)
+ /**
+  * @TODO: Documentation
+  */
+-u32 JV_LoadFile_Async2(u32 handle, u8* dst, u32 p3, u32 length, void (*callback)(u32), u32 owner)
++u32 JV_LoadFile_Async2(u32 handle, u8* dst, u32 p3, u32 length, void (*callback)(uintptr_t), uintptr_t owner)
+ {
+ 	static u32 first = TRUE;
+ 	STACK_PAD_VAR(1);
+@@ -233,7 +293,7 @@ u32 JV_LoadFile_Async2(u32 handle, u8* dst, u32 p3, u32 length, void (*callback)
+ 	strcat(name, "/");
+ 	strcat(name, JV_ARC[idx]->meta.arcName);
+ 
+-	DVDT_LoadtoDRAM(owner, name, (u32)dst, src, length, NULL, callback);
++	DVDT_LoadtoDRAM(owner, name, (uintptr_t)dst, src, length, NULL, callback);
+ 	return length;
+ }
+ 
+diff --git a/src/jaudio/waveread.c b/src/jaudio/waveread.c
+index 0a5aee5..7c310f9 100644
+--- a/src/jaudio/waveread.c
++++ b/src/jaudio/waveread.c
+@@ -16,6 +16,11 @@ CtrlGroup_* CGRP_ARRAY[16];
+  * @TODO: Documentation
+  */
+ 
++#if defined(TARGET_PC)
++// PC: the file's 4-byte offset slots can't hold a host pointer, so relocation
++// rewrites them as offsets from the .bx image base instead. See bx_pc.h.
++template <typename T> static void PTconvert(JauFilePtr<T>* slot, uintptr_t base_address) { PTconvertT(slot, base_address); }
++#else
+ static void PTconvert(void** pointer, u32 base_address)
+ {
+ 	if (*pointer == NULL) {
+@@ -27,6 +32,7 @@ static void PTconvert(void** pointer, u32 base_address)
+ 	}
+ 	*pointer = *(char**)pointer + base_address;
+ }
++#endif
+ 
+ /**
+  * @TODO: Documentation
+@@ -35,7 +41,7 @@ CtrlGroup_* Wave_Test(u8* data)
+ {
+ 	u32 i, j;
+ 	STACK_PAD_VAR(1);
+-	u32 base_addr = (u32)data;
++	uintptr_t base_addr = (uintptr_t)data;
+ 	WaveArchiveBank_* arcBank;
+ 	CtrlGroup_* group;
+ 	WaveArchive_* arc;
+@@ -46,10 +52,12 @@ CtrlGroup_* Wave_Test(u8* data)
+ 	Ctrl_* cst;
+ 	STACK_PAD_VAR(3);
+ 
+-	PTconvert((void**)&((Wsys_*)data)->waveArcBank, base_addr);
+-	PTconvert((void**)&((Wsys_*)data)->ctrlGroup, base_addr);
+-	arcBank       = *(WaveArchiveBank_**)(data + 0x10);
+-	group         = *(CtrlGroup_**)(data + 0x14);
++	PTconvert(&((Wsys_*)data)->waveArcBank, base_addr);
++	PTconvert(&((Wsys_*)data)->ctrlGroup, base_addr);
++	// PC: read through the struct, not a raw 8-byte load off the file bytes —
++	// _10/_14 are 4-byte file slots (the raw cast fetched two of them at once).
++	arcBank       = ((Wsys_*)data)->waveArcBank;
++	group         = ((Wsys_*)data)->ctrlGroup;
+ 	CGRP_ARRAY[0] = group;
+ 
+ 	if (arcBank->magic != 'WINF') {
+@@ -60,48 +68,48 @@ CtrlGroup_* Wave_Test(u8* data)
+ 	}
+ 
+ 	for (i = 0; i < arcBank->count; i++) {
+-		PTconvert((void**)&arcBank->waveGroups[i], base_addr);
++		PTconvert(&arcBank->waveGroups[i], base_addr);
+ 		arc     = arcBank->waveGroups[i];
+ 		REF_arc = &arc;
+-		Jac_InitHeap(&arc->heap);
+-		arc->heap.startAddress = 0;
++		Jac_InitHeap(&JAU_HEAP(arc->heap));
++		JAU_HEAP(arc->heap).startAddress = 0;
+ 
+ 		for (j = 0; j < arc->waveCount; j++) {
+-			PTconvert((void**)&arc->waves[j], base_addr);
++			PTconvert(&arc->waves[j], base_addr);
+ 		}
+ 	}
+ 
+ 	for (i = 0; i < group->count; i++) {
+-		PTconvert((void**)&group->scenes[i], base_addr);
++		PTconvert(&group->scenes[i], base_addr);
+ 		scene = group->scenes[i];
+-		PTconvert((void**)&scene->cdf, base_addr);
+-		PTconvert((void**)&scene->cex, base_addr);
+-		PTconvert((void**)&scene->cst, base_addr);
++		PTconvert(&scene->cdf, base_addr);
++		PTconvert(&scene->cex, base_addr);
++		PTconvert(&scene->cst, base_addr);
+ 
+ 		cdf = scene->cdf;
+ 		if (cdf && cdf->magic == 'C-DF') {
+ 			for (j = 0; j < cdf->count; j++) {
+-				PTconvert((void**)&cdf->waveIDs[j], base_addr);
+-				Jac_InitHeap(&cdf->waveIDs[j]->heap);
+-				cdf->waveIDs[j]->heap.startAddress = 0;
++				PTconvert(&cdf->waveIDs[j], base_addr);
++				Jac_InitHeap(&JAU_HEAP(cdf->waveIDs[j]->heap));
++				JAU_HEAP(cdf->waveIDs[j]->heap).startAddress = 0;
+ 			}
+ 		}
+ 
+ 		cex = scene->cex;
+ 		if (cex && cex->magic == 'C-EX') {
+ 			for (j = 0; j < cex->count; j++) {
+-				PTconvert((void**)&cex->waveIDs[j], base_addr);
+-				Jac_InitHeap(&cex->waveIDs[j]->heap);
+-				cex->waveIDs[j]->heap.startAddress = 0;
++				PTconvert(&cex->waveIDs[j], base_addr);
++				Jac_InitHeap(&JAU_HEAP(cex->waveIDs[j]->heap));
++				JAU_HEAP(cex->waveIDs[j]->heap).startAddress = 0;
+ 			}
+ 		}
+ 
+ 		cst = scene->cst;
+ 		if (cst && cst->magic == 'C-ST') {
+ 			for (j = 0; j < cst->count; j++) {
+-				PTconvert((void**)&cst->waveIDs[j], base_addr);
+-				Jac_InitHeap(&cst->waveIDs[j]->heap);
+-				cst->waveIDs[j]->heap.startAddress = 0;
++				PTconvert(&cst->waveIDs[j], base_addr);
++				Jac_InitHeap(&JAU_HEAP(cst->waveIDs[j]->heap));
++				JAU_HEAP(cst->waveIDs[j]->heap).startAddress = 0;
+ 			}
+ 		}
+ 	}

@@ -1,0 +1,8 @@
+# Normalise line endings on commit, check out native.
+* text=auto
+
+# Patches must survive a round trip byte for byte, or they stop applying.
+*.patch -text
+
+*.png binary
+*.icns binary

@@ -1,0 +1,73 @@
+# Pikmin — keyboard bindings (EXAMPLE)
+#
+# The live copy sits next to the binary for a loose build
+# (build-m1/keybindings.ini) and in ~/Library/Application Support/Pikmin/ for a
+# bundled .app. PC_CONFIG_DIR overrides both. Written on first run. This copy is reference only. Delete the
+# live one to get these defaults back.
+#
+# FORMAT
+#   action = key[, key ...]
+#
+# Several keys may share one action. An empty value unbinds the action.
+# Names are SDL key names, matched by SDL_GetScancodeFromName — "Space",
+# "Return", "Left Shift", "Right Ctrl", "A", "Up", "F1", "Keypad 5".
+# An unrecognised name is reported on stderr and skipped, e.g.
+#   [PC] keybindings.ini: 'Ctrl' is not an SDL key name (action 'z')
+# (it is "Left Ctrl" or "Right Ctrl", never bare "Ctrl").
+#
+# The section headers are cosmetic — the parser keys on the action name alone,
+# so moving a line between sections is harmless. Action names must be unique.
+#
+# Controllers are NOT configured here; SDL's GameController database maps them
+# and they stay live alongside the keyboard.
+
+[buttons]
+start   = Return
+a       = Space,X
+b       = Left Shift,C
+x       = V
+y       = B
+z       = Z
+l       = Q
+r       = E
+
+[stick]
+# Olimar's movement. The keyboard drives the stick fully deflected, so there is
+# no analog control — one more reason a pad plays better.
+up      = Up,W
+down    = Down,S
+left    = Left,A
+right   = Right,D
+
+# C-stick — camera.
+cup     = I
+cdown   = K
+cleft   = J
+cright  = L
+
+# D-pad. Unbound by default; the stick covers movement and the D-pad is only
+# used by a few menus. Bind it if you want it, e.g. dup = Keypad 8.
+dup     =
+ddown   =
+dleft   =
+dright  =
+
+# ---------------------------------------------------------------------------
+# Example of a rebind — WASD movement with the right hand on the action keys,
+# which is what you would use if you find the default two-handed layout
+# awkward. Copy into the live file to try it:
+#
+#   [buttons]
+#   a       = Period
+#   b       = Comma
+#   start   = Return
+#
+#   [stick]
+#   up      = W
+#   down    = S
+#   left    = A
+#   right   = D
+#
+# Note that with W/A/S/D taken by the stick, the defaults that shared those
+# keys (a = X, left = A) have to move — which is why `a` is rebound above.
+# ---------------------------------------------------------------------------

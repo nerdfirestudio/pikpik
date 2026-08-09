@@ -1,0 +1,44 @@
+# The decompiled game sources, fetched by setup.sh. NEVER commit these — the
+# whole point of the fetch-and-patch arrangement is that this repository does
+# not carry them. See docs/LEGAL.md.
+/vendor/
+
+# Game data, in every shape it arrives in. Also never committed, also not a
+# style preference. See docs/GAME_DATA.md.
+gamedata/
+*.iso
+*.gcm
+*.ciso
+*.nkit.iso
+*.dol
+*.gci
+*.raw
+/orig/
+/rom/
+
+# Build output
+build*/
+/dist/
+*.log
+out.log
+
+# iOS: SDL2 is downloaded and built on demand by build_ios.sh, not vendored.
+/ios/sdl2-ios/
+/ios/SDL2-*/
+/ios/build-sdl2/
+
+# Xcode per-developer state: window layout, breakpoints, schemes.
+xcuserdata/
+*.xcuserstate
+/app/*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# Local overrides, if you keep any beyond the committed build.conf
+/build.local.conf
+
+# Capture artifacts from GPU debugging
+*.gputrace/
+Texture 0x*.png
+
+__pycache__/
+*.pyc
+.DS_Store

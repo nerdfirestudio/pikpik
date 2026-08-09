@@ -1,0 +1,63 @@
+# Pikmin — settings (EXAMPLE)
+#
+# The live copy sits next to the binary for a loose build (build-m1/settings.ini)
+# and in ~/Library/Application Support/Pikmin/ for a bundled .app — a .app
+# cannot be written into without breaking its signature. PC_CONFIG_DIR overrides
+# both. It is written automatically on first run. This copy is reference only;
+# editing it does nothing. Delete the live one to get the defaults back.
+#
+# Precedence: environment variable > this file > built-in default.
+# So PC_AUDIO=1 still wins over `enabled = 0` here, and every existing
+# PC_* recipe keeps working unchanged. See docs/CONFIG.md.
+
+[video]
+
+# Window size, as a multiple of the GameCube's 640x480. Clamped to 1..6.
+#   1 = 640x480    2 = 1280x960 (default)    3 = 1920x1440
+# On a Retina display the drawable is 2x this; the window is what you see.
+scale      = 2
+
+# Start fullscreen. The scene is letterboxed into a 4:3 viewport, so a
+# non-4:3 display gets bars rather than a stretched image.
+# You can also toggle at runtime with Cmd-F, F11 or Alt-Enter, and the
+# green window button works. Escape leaves fullscreen (it does NOT quit).
+fullscreen = 0
+
+[audio]
+
+# Master switch for jaudio. 0 boots silently — the public Jac_* entry points
+# early-return, so nothing in the audio stack runs at all.
+enabled = 1
+
+[input]
+
+# 0 ignores controllers entirely and leaves the keyboard live.
+# A controller is otherwise always active alongside the keyboard; the two are
+# OR-ed together, so you can use both at once.
+#
+# SDL's GameController layer supplies the mapping, so DualSense/DualShock,
+# Xbox and Switch Pro pads all work without configuration. Pikmin wants the
+# analog triggers and both sticks, so a pad plays considerably better than
+# the keyboard whatever you bind.
+gamepad = 1
+
+[sync]
+
+# Save sync across your own devices — see docs/SAVE_SYNC.md. Off unless BOTH
+# server and key are set; a half-set pair warns on stdout rather than failing
+# quietly. Overridable with PC_SYNC_SERVER / PC_SYNC_KEY / PC_SYNC_DEVICE.
+
+# Base URL of the sync server (the prior port/sync-server). Empty = sync off.
+# Plain http is fine on a LAN. On iOS anything outside the LAN needs https,
+# because App Transport Security is only lifted for local addresses.
+server =
+
+# Any phrase you invent. IDENTICAL on every device that shares the save —
+# that is the entire pairing step. It never goes on the wire (the server sees
+# only domain-separated SHA-256 digests of it) but it IS the credential:
+# whoever has it has the save.
+key =
+
+# Name shown to your other devices when this one is holding the save
+# ("the save is in use by ..."). Defaults to the hostname.
+device =
