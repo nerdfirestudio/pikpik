@@ -17,9 +17,10 @@ Python 3 is used by the icon generator and some tools; the system one is fine.
 is developed against. It is a shim that dlopens SDL3 at runtime, which
 `bundle_mac.sh` accounts for when it assembles the app.
 
-## 2. Fetch the game source
+## 2. Get the sources
 
 ```bash
+git clone https://github.com/magikarp/pikpik.git && cd pikpik
 ./setup.sh
 ```
 

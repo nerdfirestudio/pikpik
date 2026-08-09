@@ -27,7 +27,7 @@ archives are device slices. Run it on hardware.
 ## Step 1 — Get the sources
 
 ```bash
-git clone <your fork> pikpik && cd pikpik
+git clone https://github.com/magikarp/pikpik.git && cd pikpik
 ./setup.sh
 ```
 

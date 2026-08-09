@@ -95,6 +95,35 @@ fine one and it is drawn deliberately: it keeps section 2's claim literally
 true, and it means a request to take the image down is satisfied somewhere else
 entirely, without touching this repository or its history.
 
+### No Nintendo code is read or executed
+
+Worth stating precisely, because what the port needs is narrower than "the
+disc". It reads the game's **content** — files under the extracted filesystem,
+opened by name. It does not read, load, or run code from that data:
+
+- `main.dol`, the game's executable, is never opened. The only code that runs
+  is compiled from the decompilation and from this repository.
+- The apploader and the disc headers (`boot.bin`, `bi2.bin`) are never opened.
+  An extracted disc usually carries a directory of those system files
+  alongside the content; the port ignores it completely.
+- The filesystem table (`fst.bin`) is never parsed.
+  `DVDConvertPathToEntrynum` maps a path string to a host file and interns it,
+  so an entry number is an index into that table and nothing more.
+- `DVDGetCurrentDiskID` reads nothing at all — it synthesises the identifier in
+  code.
+- The GameCube's audio DSP microcode is not loaded either. `pc_dsp.cpp`
+  reimplements what that microcode did; no microcode binary is read or
+  executed.
+
+That is checkable in `pc/src/pc_sdk_shims.cpp` and `pc/src/pc_dsp.cpp` rather
+than taken on trust.
+
+It is a narrow claim and should not be read as a broad one. The content files
+are still Nintendo's copyrighted work — the textures, models, audio and level
+data are theirs, you supply them, and nothing here changes that. What it does
+mean is that no Nintendo program is executed at any point, natively or in
+emulation.
+
 Supply it yourself, from your own disc. Whether ripping a disc you own is
 lawful depends on where you live: some jurisdictions permit a personal backup,
 others prohibit circumventing the copy protection required to make one, and
@@ -120,7 +149,8 @@ build has no artwork of contested provenance anywhere in it.
 
 ## 7. If you are a rights holder
 
-Open an issue, or use GitHub's designated agent process. A notice that
+Open an issue at https://github.com/magikarp/pikpik, or use GitHub's
+designated agent process. A notice that
 identifies specific material will be acted on promptly and without argument;
 the maintainers would rather take something down than litigate it.
 

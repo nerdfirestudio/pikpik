@@ -58,7 +58,7 @@ on top of it plus a host layer. See [CREDITS.md](CREDITS.md).
 ## Build it — macOS
 
 ```bash
-git clone <your fork of this repository> pikpik && cd pikpik
+git clone https://github.com/magikarp/pikpik.git && cd pikpik
 ./setup.sh
 ```
 
