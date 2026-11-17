@@ -1,0 +1,32 @@
+# Codemagic build of an unsigned pikpik IPA for sideloading with AltStore.
+# Game data is not part of the build: it is copied into the app's gamedata folder in Files.
+workflows:
+  ios-unsigned:
+    name: iPhone unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    environment:
+      # The project file needs Xcode 16 or newer (objectVersion 77).
+      xcode: 16.4
+    scripts:
+      - name: Build tools
+        script: brew install cmake
+      - name: Fetch the decompilation and apply the port's patches
+        script: ./setup.sh
+      - name: Build the engine libraries
+        script: ./build_ios.sh
+      - name: Build the app, unsigned
+        script: |
+          xcodebuild -project app/pikpik.xcodeproj -target pikpik -configuration Release -sdk iphoneos \
+            PRODUCT_BUNDLE_IDENTIFIER=com.nerdfirestudio.pikpik \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            SYMROOT="$CM_BUILD_DIR/build-xcode" build
+      - name: Package unsigned IPA
+        script: |
+          APP="$(find "$CM_BUILD_DIR/build-xcode/Release-iphoneos" -maxdepth 1 -name '*.app' | head -1)"
+          ls -la "$APP"
+          mkdir -p dist/Payload && cp -R "$APP" dist/Payload/
+          (cd dist && zip -qry pikpik-iOS-unsigned.ipa Payload)
+          ls -la dist
+    artifacts:
+      - dist/*.ipa
