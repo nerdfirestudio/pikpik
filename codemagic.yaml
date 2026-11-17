@@ -13,8 +13,13 @@ workflows:
         script: brew install cmake
       - name: Fetch the decompilation and apply the port's patches
         script: ./setup.sh
+      # CMake 4 takes the SDK from SDKROOT when nothing sets CMAKE_OSX_SYSROOT; unset, SDL's iOS
+      # build cannot find OpenGLES/ES1/gl.h (build #1).
       - name: Build the engine libraries
-        script: ./build_ios.sh
+        script: |
+          export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDKROOT=$SDKROOT"
+          ./build_ios.sh
       - name: Build the app, unsigned
         script: |
           xcodebuild -project app/pikpik.xcodeproj -target pikpik -configuration Release -sdk iphoneos \
