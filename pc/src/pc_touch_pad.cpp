@@ -47,6 +47,8 @@
 #define TP_BTN_Y     0x0800
 #define TP_BTN_START 0x1000
 #define TP_BTN_L     0x0040
+#define TP_BTN_R     0x0020
+#define TP_BTN_Z     0x0010
 
 #define TP_MAX_FINGERS 10
 #define TP_STICK_TRAVEL 0.115f // unit-space deflection for full stick
@@ -69,6 +71,19 @@
 // as the button cluster so the two read as one row.
 #define TP_HINT_X 0.209f
 #define TP_HINT_Y 0.678f
+
+// C-stick (Justin, 2026-11-25: "the c stick controls moving the entire group of
+// pikmin, that's a crucial part"). A FIXED yellow pad above the face cluster, as
+// on the GameCube where it sits right of and below the buttons. Fixed rather than
+// floating because the right thumb is already busy finding A and B; a finger that
+// lands inside the gate owns it, and deflection is measured from the pad's
+// centre, so a flick toward an edge swarms that way at once.
+#define TP_CSTICK_FR     0.205f // centre, as an offset from the right edge
+#define TP_CSTICK_Y      0.420f
+#define TP_CSTICK_GATE   0.070f // drawn ring radius
+#define TP_CSTICK_TRAVEL 0.050f // deflection for a full swarm push
+#define TP_CSTICK_KNOB   0.030f
+#define TP_CSTICK_GRAB   0.095f // touch radius that claims the pad
 
 typedef struct {
 	const char* label; // drawn with the stroke font; NULL for none
@@ -111,14 +126,20 @@ static const TPButton tp_buttons[] = {
 	{ "X",     0.030f, 0.1031f, 0.6963f, 0.058f, 0.029f, 0.029f,  98.0f, 1, TP_BTN_X,     216, 212, 206 },
 	{ "Y",     0.030f, 0.2346f, 0.6007f, 0.058f, 0.029f, 0.029f,  10.0f, 1, TP_BTN_Y,     216, 212, 206 },
 	{ "L",     0.030f, 0.1280f, 0.0980f, 0.076f, 0.032f, 0.030f,   0.0f, 0, TP_BTN_L,     169, 169, 206 },
-	{ "START", 0.023f, 0.1180f, 0.0920f, 0.030f, 0.030f, 0.030f,   0.0f, 1, TP_BTN_START, 168, 168, 168 },
+	// R and Z (Justin, 2026-11-25: "it only has a L button, no R or Z"). R mirrors
+	// L in the top RIGHT corner, as the right shoulder; Z sits just under it, the
+	// way the GameCube's small purple Z rides above R. Start moves inward to make
+	// room and stays well clear of both thumbs.
+	{ "R",     0.030f, 0.1280f, 0.0980f, 0.076f, 0.032f, 0.030f,   0.0f, 1, TP_BTN_R,     169, 169, 206 },
+	{ "Z",     0.026f, 0.1280f, 0.1980f, 0.058f, 0.027f, 0.027f,   0.0f, 1, TP_BTN_Z,     138, 112, 214 },
+	{ "START", 0.023f, 0.3000f, 0.0920f, 0.030f, 0.030f, 0.030f,   0.0f, 1, TP_BTN_START, 168, 168, 168 },
 };
 #define TP_NUM_BUTTONS ((int)(sizeof(tp_buttons) / sizeof(tp_buttons[0])))
 
 // START does not fit inside a 0.03-radius button, so it is set beneath it —
 // which is where the real controller prints it too. Everything else is labelled
 // on the button face.
-#define TP_START_INDEX 5
+#define TP_START_INDEX 7 // its row in tp_buttons; R and Z were added ahead of it
 #define TP_START_LABEL_DY 0.052f
 
 typedef struct {
@@ -126,6 +147,7 @@ typedef struct {
 	int active;
 	int button;   // index into tp_buttons, or -1
 	int is_stick;
+	int is_cstick;
 	float ux, uy; // current position, unit space
 	float ax, ay; // stick anchor, unit space
 } TPFinger;
@@ -241,6 +263,18 @@ static TPFinger* tp_alloc(SDL_FingerID id)
 	return NULL;
 }
 
+static float tp_cstick_x(void) { return tp_aspect - TP_CSTICK_FR; }
+
+static int tp_cstick_owner(void)
+{
+	for (int i = 0; i < TP_MAX_FINGERS; i++) {
+		if (tp_fingers[i].active && tp_fingers[i].is_cstick) {
+			return i;
+		}
+	}
+	return -1;
+}
+
 static int tp_stick_owner(void)
 {
 	for (int i = 0; i < TP_MAX_FINGERS; i++) {
@@ -322,8 +356,11 @@ void pc_touch_pad_handle_event(const void* sdl_event)
 		// Buttons win over the stick zone where they overlap, so a button
 		// placed inside the left zone (L, Start) still works.
 		const int hit = tp_button_hit(ux, uy);
+		const float cdx = ux - tp_cstick_x(), cdy = uy - TP_CSTICK_Y;
 		if (hit >= 0) {
 			f->button = hit;
+		} else if (cdx * cdx + cdy * cdy <= TP_CSTICK_GRAB * TP_CSTICK_GRAB && tp_cstick_owner() < 0) {
+			f->is_cstick = 1;
 		} else if (ux < TP_ZONE_X && uy > TP_ZONE_Y && tp_stick_owner() < 0) {
 			f->is_stick = 1;
 			f->ax       = ux;
@@ -354,7 +391,8 @@ void pc_touch_pad_handle_event(const void* sdl_event)
 	}
 }
 
-void pc_touch_pad_apply(unsigned short* buttons, signed char* stickX, signed char* stickY, unsigned char* trigL)
+void pc_touch_pad_apply(unsigned short* buttons, signed char* stickX, signed char* stickY, signed char* subX,
+                        signed char* subY, unsigned char* trigL, unsigned char* trigR)
 {
 	if (!tp_active()) {
 		return;
@@ -377,6 +415,20 @@ void pc_touch_pad_apply(unsigned short* buttons, signed char* stickX, signed cha
 			if (mask == TP_BTN_L && trigL && *trigL < 255) {
 				*trigL = 255;
 			}
+			if (mask == TP_BTN_R && trigR && *trigR < 255) {
+				*trigR = 255; // same full pull for R, read the same way as L
+			}
+		}
+		if (f->is_cstick && subX && subY) {
+			float cx = (f->ux - tp_cstick_x()) * (TP_STICK_MAG / TP_CSTICK_TRAVEL);
+			float cy = -(f->uy - TP_CSTICK_Y) * (TP_STICK_MAG / TP_CSTICK_TRAVEL); // unit y down -> GC y up
+			const float m = sqrtf(cx * cx + cy * cy);
+			if (m > TP_STICK_MAG) {
+				cx *= TP_STICK_MAG / m;
+				cy *= TP_STICK_MAG / m;
+			}
+			*subX = (signed char)cx;
+			*subY = (signed char)cy;
 		}
 		if (f->is_stick) {
 			float sx = (f->ux - f->ax) * (TP_STICK_MAG / TP_STICK_TRAVEL);
@@ -508,6 +560,37 @@ int pc_touch_pad_get_shapes(PcTouchShape* out, int max)
 		s->edgew                  = 0.005f;
 		tp_set_rgba(s->fill, 1.0f, 1.0f, 1.0f, 0.22f + 0.32f * lit);
 		tp_set_rgba(s->edge, 1.0f, 1.0f, 1.0f, 0.48f + 0.38f * lit);
+	}
+
+	// C-stick: yellow gate fixed in place, knob follows the finger inside it.
+	{
+		const float gx = tp_cstick_x(), gy = TP_CSTICK_Y;
+		const int co    = tp_cstick_owner();
+		float cx = gx, cy = gy, clit = 0.0f;
+		if (co >= 0) {
+			const float dx = tp_fingers[co].ux - gx, dy = tp_fingers[co].uy - gy;
+			const float d2 = dx * dx + dy * dy, lim = TP_CSTICK_GATE - TP_CSTICK_KNOB - 0.004f;
+			const float k  = d2 > lim * lim ? lim / sqrtf(d2) : 1.0f;
+			cx             = gx + dx * k;
+			cy             = gy + dy * k;
+			clit           = 1.0f;
+		}
+		if (PcTouchShape* s = tp_push(&p, &n, max)) {
+			s->cx = gx;
+			s->cy = gy;
+			s->hw = s->hh = s->radius = TP_CSTICK_GATE;
+			s->edgew                  = 0.0055f;
+			tp_set_rgba(s->fill, 0.96f, 0.80f, 0.20f, 0.07f + 0.08f * clit);
+			tp_set_rgba(s->edge, 0.98f, 0.85f, 0.35f, 0.45f + 0.35f * clit);
+		}
+		if (PcTouchShape* s = tp_push(&p, &n, max)) {
+			s->cx = cx;
+			s->cy = cy;
+			s->hw = s->hh = s->radius = TP_CSTICK_KNOB;
+			s->edgew                  = 0.005f;
+			tp_set_rgba(s->fill, 0.96f, 0.80f, 0.20f, 0.30f + 0.40f * clit);
+			tp_set_rgba(s->edge, 1.0f, 0.90f, 0.45f, 0.55f + 0.35f * clit);
+		}
 	}
 
 	// Bodies first, then every label, so no button face can overdraw a

@@ -446,6 +446,31 @@ static id<MTLRenderPipelineState> pc_get_pso(int blendcode, int atest) {
 	return s_psos[idx][blendcode];
 }
 
+// ---- widescreen -------------------------------------------------------------
+// Justin, 2026-11-25: "make it widescreen like we did with zelda 64". The game's
+// cameras widen themselves (patches/0005: CullFrustum::update multiplies a 4:3
+// aspect by pc_widescreen_scale), so 3D needs nothing here but the full-width
+// viewport. 2D batches (depth-word bit 12, ortho projection) are narrowed back to
+// 4:3 and centred so the HUD keeps its shape, unless the batch spans the whole
+// screen (fades, full-screen backdrops), which is stretched to fill. Segments that
+// feed a SUB-RECT EFB copy (shadow and effect textures drawn into a corner of the
+// EFB) keep the old 4:3 viewport, so the copy still samples what it expects.
+// On by default on iPhone/iPad; PC_WIDESCREEN=0 turns it off, =1 forces it on Mac.
+static float s_ws_scale = 1.0f; // target aspect / (4/3), 1 when off or not wider
+static int pc_widescreen_enabled(void) {
+	static int on = -1;
+	if (on < 0) {
+		const char* e = getenv("PC_WIDESCREEN");
+#if TARGET_OS_IPHONE
+		on = e ? (atoi(e) != 0) : 1;
+#else
+		on = e ? (atoi(e) != 0) : 0;
+#endif
+	}
+	return on;
+}
+extern "C" float pc_widescreen_scale(void) { return s_ws_scale; }
+
 extern "C" void pc_window_submit_tris(const float* verts, int vertCount, int tex, int depth, const PcTevProg* prog) {
 	// Report the UNCAPPED demand: a pinned counter reads the same whether the
 	// frame wanted one vert more than capacity or ten times it.
@@ -636,11 +661,12 @@ using namespace metal;
 // color (RAS), and the two generated texcoords. The TEV program rides in a
 // per-segment uniform (TevU) and is evaluated exactly, stage by stage.
 struct VOut { float4 pos [[position]]; float4 color; float4 spec; float2 st; float2 st2; };
-vertex VOut vmain(const device float* v [[buffer(0)]], uint vid [[vertex_id]]) {
+vertex VOut vmain(const device float* v [[buffer(0)]], constant float& xscale [[buffer(1)]], uint vid [[vertex_id]]) {
 	const device float* p = v + vid * 16;
 	VOut o;
 	// GX clip z is [-w, 0]; Metal wants [0, w]: z' = z + w.
-	o.pos = float4(p[0], p[1], p[2] + p[3], p[3]);
+	// xscale: widescreen narrows 2D (HUD) batches back to their 4:3 shape; 1 otherwise.
+	o.pos = float4(p[0] * xscale, p[1], p[2] + p[3], p[3]);
 	o.color = float4(p[4], p[5], p[6], p[7]);   // channel 0: lit diffuse
 	o.spec = float4(p[12], p[13], p[14], p[15]); // channel 1: lit specular
 	o.st = float2(p[8], p[9]);
@@ -1139,7 +1165,7 @@ extern "C" void pc_window_get_pad(unsigned short* buttons, signed char* stickX, 
 	// A connected controller hides the overlay entirely, so the two cannot
 	// fight; the pad is the source of truth whenever one is present.
 	pc_touch_pad_set_controller(s_pad != NULL);
-	pc_touch_pad_apply(&b, stickX, stickY, trigL);
+	pc_touch_pad_apply(&b, stickX, stickY, subX, subY, trigL, trigR);
 
 	// Presses caught by the event loop since the last read: OR them in so a
 	// tap shorter than one frame still registers, then clear so each latched
@@ -1329,6 +1355,7 @@ extern "C" void pc_window_frame(void) {
 		{
 			const double tw = (double)sceneTarget.width, th = (double)sceneTarget.height;
 			const double want = 4.0 / 3.0;
+			s_ws_scale = (pc_widescreen_enabled() && th > 0.0 && tw / th > want + 0.01) ? (float)((tw / th) / want) : 1.0f;
 			if (tw > 0.0 && th > 0.0 && fabs(tw / th - want) > 0.001) {
 				double vw = tw, vh = th;
 				if (tw / th > want) {
@@ -1389,7 +1416,24 @@ extern "C" void pc_window_frame(void) {
 		id<MTLCommandBuffer> cmd = [s_queue commandBuffer];
 		id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
 		pc_bind_tev_defaults(enc);
-		if (s_do_letterbox) [enc setViewport:s_letterbox];
+		// Viewport per segment (see widescreen notes): -1 = encoder default (full).
+		const bool ws = s_ws_scale > 1.0f;
+		int vp_mode = -1;
+		auto seg_is_rtt = [&](int seg) -> bool {
+			// The first copy event after this segment is the one that captures it.
+			for (int e = 0; e < s_ncopy_events; e++)
+				if (s_copy_events[e].after_seg > seg)
+					return s_copy_events[e].sw < 620 || s_copy_events[e].sh < 460;
+			return false;
+		};
+		auto set_vp = [&](int want) {
+			if (want == vp_mode) return;
+			if (want == 1) [enc setViewport:s_letterbox];
+			else [enc setViewport:(MTLViewport){ 0.0, 0.0, (double)sceneTarget.width, (double)sceneTarget.height, 0.0, 1.0 }];
+			vp_mode = want;
+		};
+		if (s_do_letterbox && !ws) set_vp(1);
+		{ const float one = 1.0f; [enc setVertexBytes:&one length:sizeof(one) atIndex:1]; }
 		if (getenv("PC_DIAG_DRAW")) {
 			static int s_diag_frame;
 			if ((s_diag_frame++ % 60) == 0)
@@ -1461,7 +1505,8 @@ extern "C" void pc_window_frame(void) {
 				// but this one is real, and only shows in fullscreen.
 				float rx = s_copy_events[ev].sx / 640.0f, ry = s_copy_events[ev].sy / 480.0f;
 				float rw = s_copy_events[ev].sw / 640.0f, rh = s_copy_events[ev].sh / 480.0f;
-				if (s_do_letterbox) {
+				const bool copy_rtt = s_copy_events[ev].sw < 620 || s_copy_events[ev].sh < 460;
+				if (s_do_letterbox && (!ws || copy_rtt)) {
 					const float tw = (float)sceneTarget.width, th = (float)sceneTarget.height;
 					const float vx = (float)s_letterbox.originX / tw, vy = (float)s_letterbox.originY / th;
 					const float vw = (float)s_letterbox.width / tw, vh = (float)s_letterbox.height / th;
@@ -1481,7 +1526,8 @@ extern "C" void pc_window_frame(void) {
 			pass.depthAttachment.loadAction = la;
 			enc = [cmd renderCommandEncoderWithDescriptor:pass];
 			pc_bind_tev_defaults(enc); // a fresh encoder starts with nothing bound
-			if (s_do_letterbox) [enc setViewport:s_letterbox]; // pass resumed after an EFB copy
+			vp_mode = -1; // fresh encoder: full viewport until a segment asks otherwise
+			if (s_do_letterbox && !ws) set_vp(1); // pass resumed after an EFB copy
 			if (s_tri_verts) [enc setVertexBuffer:s_vbuf[s_vbuf_idx] offset:0 atIndex:0];
 		};
 		if (s_tri_verts) {
@@ -1505,6 +1551,23 @@ extern "C" void pc_window_frame(void) {
 				if (t == -2) continue; // EFB-copy texture we can't populate; skip (scene shows through)
 				int blendcode = (s_draw_segs[i].depth >> 2) & 0x7f;
 				int atest = (s_draw_segs[i].depth >> 9) & 1;
+				if (ws) {
+					const bool rtt = s_do_letterbox && seg_is_rtt(i);
+					set_vp(rtt ? 1 : 0);
+					float xs = 1.0f;
+					if (!rtt && ((s_draw_segs[i].depth >> 12) & 1)) {
+						// 2D batch: keep its 4:3 shape unless it covers the full width.
+						float lo = 1e9f, hi = -1e9f;
+						const float* vv = &s_tris[(size_t)s_draw_segs[i].start * 16];
+						for (int k = 0; k < s_draw_segs[i].count; k++, vv += 16) {
+							const float w = vv[3] != 0.0f ? vv[3] : 1.0f, x = vv[0] / w;
+							if (x < lo) lo = x;
+							if (x > hi) hi = x;
+						}
+						if (!(lo <= -0.97f && hi >= 0.97f)) xs = 1.0f / s_ws_scale;
+					}
+					[enc setVertexBytes:&xs length:sizeof(xs) atIndex:1];
+				}
 				static int s_nodepth = -1;
 				if (s_nodepth < 0) s_nodepth = getenv("PC_NO_DEPTH") ? 1 : 0;
 				// PC_NO_DEPTH: force Always-compare (keep write bit) to test whether

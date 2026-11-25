@@ -421,7 +421,8 @@ static void pc_cap_push_tri(float* a, float* b, float* c) {
 	}
 	// open/extend the segment for the current texture + depth + TEV program
 	int depth = (s_zmode_enable ? 1 : 0) | (s_zmode_write ? 2 : 0) | (s_blend << 2) | (s_atest << 9)
-	          | ((s_cull_mode & 3) << 10);
+	          | ((s_cull_mode & 3) << 10)
+	          | ((s_cap.projPersp ? 0 : 1) << 12); // ortho (2D/HUD) batch: pc_window keeps it 4:3 in widescreen
 	pc_tev_snapshot();
 	if ((s_cap.curTex == -1 || s_cap.curTex == -3) && getenv("PC_TEXDIAG")) {
 		static u32 seen[64]; static int nseen;

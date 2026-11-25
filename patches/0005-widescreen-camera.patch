@@ -1,0 +1,23 @@
+--- a/src/sysCommon/camera.cpp
++++ b/src/sysCommon/camera.cpp
+@@ -308,8 +308,20 @@
+ /**
+  * @todo: Documentation
+  */
++#ifdef TARGET_PC
++extern "C" float pc_widescreen_scale(void); // PC: pc_window.mm, 1.0 when widescreen is off
++#endif
+ void CullFrustum::update(f32 aspectRatio, f32 fov, f32 near, f32 far)
+ {
++#ifdef TARGET_PC
++	// PC widescreen: every game camera asks for the GameCube's 640/480. Widening
++	// that one number here widens both the projection (setPerspective reads
++	// mAspectRatio) and the culling planes below, so nothing pops at the new edges.
++	// Cameras built for other shapes (1.0 shadow and texture cameras) are left alone.
++	if (aspectRatio > 1.32f && aspectRatio < 1.35f) {
++		aspectRatio *= pc_widescreen_scale();
++	}
++#endif
+ 	mAspectRatio   = aspectRatio;
+ 	mVerticalScale = 1.0f;
+ 	mFov           = fov;

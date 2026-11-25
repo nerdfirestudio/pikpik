@@ -22,7 +22,7 @@ extern "C" {
 #define PC_TOUCH_GLYPH_MAX 8     // glyphs per label
 // Font coverage, in the shader's table order. Six letters is all the pad
 // needs, plus the two extra that spell START.
-#define PC_TOUCH_GLYPH_SET "ABLRSTXY"
+#define PC_TOUCH_GLYPH_SET "ABLRSTXYZ"
 
 // One drawable primitive: a rounded box (a circle or capsule when the corner
 // radius saturates), optionally outlined, optionally carrying a label.
@@ -63,12 +63,13 @@ void pc_touch_pad_advance(float dt);
 // Feed every SDL_FINGER* event. Takes void* so this header stays SDL-free.
 void pc_touch_pad_handle_event(const void* sdl_event);
 
-// OR the overlay's state into a pad sample. trigL gets the analog value for
-// L, which the camera's partial-hold path reads separately from the bit.
-void pc_touch_pad_apply(unsigned short* buttons, signed char* stickX, signed char* stickY, unsigned char* trigL);
+// OR the overlay's state into a pad sample. trigL/trigR get the analog value for
+// L/R, which the camera's partial-hold path reads separately from the bit.
+void pc_touch_pad_apply(unsigned short* buttons, signed char* stickX, signed char* stickY, signed char* subX,
+                        signed char* subY, unsigned char* trigL, unsigned char* trigR);
 
 // Fills out[] with the shapes to draw, back to front; returns how many. 0 when
-// hidden. 32 is always enough for the current layout.
+// hidden. 32 is always enough for the current layout (22 shapes with R, Z and the C-stick).
 int pc_touch_pad_get_shapes(PcTouchShape* out, int max);
 
 #ifdef __cplusplus

@@ -57,8 +57,8 @@ static const char* kTouchShader =
     "};\n"
     // Stroke font. Each glyph is a run of segments in an em box: x spans
     // 0..0.60, y spans 0 (cap top) to 1 (baseline), y DOWN to match unit
-    // space. Runs are in PC_TOUCH_GLYPH_SET order: A B L R S T X Y.
-    "constant float4 kSeg[40] = {\n"
+    // space. Runs are in PC_TOUCH_GLYPH_SET order: A B L R S T X Y Z.
+    "constant float4 kSeg[43] = {\n"
     "  {0.00,1.00,0.30,0.00},{0.30,0.00,0.60,1.00},{0.10,0.68,0.50,0.68},\n" // A
     "  {0.06,0.00,0.06,1.00},{0.06,0.00,0.36,0.00},{0.36,0.00,0.52,0.12},\n" // B
     "  {0.52,0.12,0.52,0.34},{0.52,0.34,0.36,0.47},{0.36,0.47,0.06,0.47},\n"
@@ -75,9 +75,10 @@ static const char* kTouchShader =
     "  {0.00,0.02,0.60,0.02},{0.30,0.02,0.30,1.00},\n" // T
     "  {0.03,0.00,0.57,1.00},{0.57,0.00,0.03,1.00},\n" // X
     "  {0.03,0.00,0.30,0.52},{0.57,0.00,0.30,0.52},{0.30,0.52,0.30,1.00},\n" // Y
+    "  {0.04,0.02,0.56,0.02},{0.56,0.02,0.04,0.98},{0.04,0.98,0.58,0.98},\n" // Z
     "};\n"
-    "constant int kFirst[8] = { 0, 3, 13, 15, 22, 33, 35, 37 };\n"
-    "constant int kCount[8] = { 3, 10,  2,  7, 11,  2,  2,  3 };\n"
+    "constant int kFirst[9] = { 0, 3, 13, 15, 22, 33, 35, 37, 40 };\n"
+    "constant int kCount[9] = { 3, 10,  2,  7, 11,  2,  2,  3,  3 };\n"
     "static float sd_box(float2 p, float2 b, float r) {\n"
     "  float2 q = abs(p) - b + r;\n"
     "  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;\n"
