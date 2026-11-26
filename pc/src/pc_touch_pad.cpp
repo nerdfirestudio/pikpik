@@ -73,17 +73,19 @@
 #define TP_HINT_Y 0.678f
 
 // C-stick (Justin, 2026-11-25: "the c stick controls moving the entire group of
-// pikmin, that's a crucial part"). A FIXED yellow pad above the face cluster, as
-// on the GameCube where it sits right of and below the buttons. Fixed rather than
-// floating because the right thumb is already busy finding A and B; a finger that
-// lands inside the gate owns it, and deflection is measured from the pad's
-// centre, so a flick toward an edge swarms that way at once.
-#define TP_CSTICK_FR     0.205f // centre, as an offset from the right edge
-#define TP_CSTICK_Y      0.420f
-#define TP_CSTICK_GATE   0.070f // drawn ring radius
-#define TP_CSTICK_TRAVEL 0.050f // deflection for a full swarm push
-#define TP_CSTICK_KNOB   0.030f
-#define TP_CSTICK_GRAB   0.095f // touch radius that claims the pad
+// pikmin, that's a crucial part"). FLOATING, like the main stick (Justin, same
+// day: "a floating stick to the left of the A button like the main stick but
+// only on the right side and not interfere with the buttons"). The first finger
+// to land in the right half that is not on or near a button anchors the yellow
+// stick where it touched; dragging swarms, lifting recentres. The idle hint sits
+// left of B so the player knows where it lives.
+#define TP_CSTICK_ZONE_X  0.52f  // fraction of the width; right of this is C-stick ground
+#define TP_CSTICK_HINT_FR 0.480f // idle hint centre, as an offset from the right edge
+#define TP_CSTICK_HINT_Y  0.700f
+#define TP_CSTICK_GATE    0.085f // drawn ring radius
+#define TP_CSTICK_TRAVEL  0.065f // deflection for a full swarm push
+#define TP_CSTICK_KNOB    0.036f
+#define TP_CSTICK_KEEPOUT 0.045f // a miss this close to a button is ignored, not a swarm
 
 typedef struct {
 	const char* label; // drawn with the stroke font; NULL for none
@@ -149,7 +151,7 @@ typedef struct {
 	int is_stick;
 	int is_cstick;
 	float ux, uy; // current position, unit space
-	float ax, ay; // stick anchor, unit space
+	float ax, ay; // stick anchor, unit space (main stick and C-stick)
 } TPFinger;
 
 // Idle dimming. Touch controls are always in the way of something, so the
@@ -263,7 +265,7 @@ static TPFinger* tp_alloc(SDL_FingerID id)
 	return NULL;
 }
 
-static float tp_cstick_x(void) { return tp_aspect - TP_CSTICK_FR; }
+static float tp_cstick_hint_x(void) { return tp_aspect - TP_CSTICK_HINT_FR; }
 
 static int tp_cstick_owner(void)
 {
@@ -356,11 +358,22 @@ void pc_touch_pad_handle_event(const void* sdl_event)
 		// Buttons win over the stick zone where they overlap, so a button
 		// placed inside the left zone (L, Start) still works.
 		const int hit = tp_button_hit(ux, uy);
-		const float cdx = ux - tp_cstick_x(), cdy = uy - TP_CSTICK_Y;
 		if (hit >= 0) {
 			f->button = hit;
-		} else if (cdx * cdx + cdy * cdy <= TP_CSTICK_GRAB * TP_CSTICK_GRAB && tp_cstick_owner() < 0) {
-			f->is_cstick = 1;
+		} else if (ux > tp_aspect * TP_CSTICK_ZONE_X && uy > TP_ZONE_Y) {
+			// Right half: the floating C-stick, unless the touch is a near-miss
+			// on a button. A thumb reaching for A that lands just short must not
+			// fling the whole squad, so that band does nothing at all.
+			float nearest = 1.0f;
+			for (int i = 0; i < TP_NUM_BUTTONS; i++) {
+				const float d = tp_btn_distance(&tp_buttons[i], ux, uy);
+				nearest       = d < nearest ? d : nearest;
+			}
+			if (nearest > TP_CSTICK_KEEPOUT && tp_cstick_owner() < 0) {
+				f->is_cstick = 1;
+				f->ax        = ux;
+				f->ay        = uy;
+			}
 		} else if (ux < TP_ZONE_X && uy > TP_ZONE_Y && tp_stick_owner() < 0) {
 			f->is_stick = 1;
 			f->ax       = ux;
@@ -420,8 +433,8 @@ void pc_touch_pad_apply(unsigned short* buttons, signed char* stickX, signed cha
 			}
 		}
 		if (f->is_cstick && subX && subY) {
-			float cx = (f->ux - tp_cstick_x()) * (TP_STICK_MAG / TP_CSTICK_TRAVEL);
-			float cy = -(f->uy - TP_CSTICK_Y) * (TP_STICK_MAG / TP_CSTICK_TRAVEL); // unit y down -> GC y up
+			float cx = (f->ux - f->ax) * (TP_STICK_MAG / TP_CSTICK_TRAVEL);
+			float cy = -(f->uy - f->ay) * (TP_STICK_MAG / TP_CSTICK_TRAVEL); // unit y down -> GC y up
 			const float m = sqrtf(cx * cx + cy * cy);
 			if (m > TP_STICK_MAG) {
 				cx *= TP_STICK_MAG / m;
@@ -562,10 +575,15 @@ int pc_touch_pad_get_shapes(PcTouchShape* out, int max)
 		tp_set_rgba(s->edge, 1.0f, 1.0f, 1.0f, 0.48f + 0.38f * lit);
 	}
 
-	// C-stick: yellow gate fixed in place, knob follows the finger inside it.
+	// C-stick: yellow gate at the finger's anchor (or the idle hint left of B),
+	// knob follows the finger inside it.
 	{
-		const float gx = tp_cstick_x(), gy = TP_CSTICK_Y;
-		const int co    = tp_cstick_owner();
+		const int co = tp_cstick_owner();
+		float gx = tp_cstick_hint_x(), gy = TP_CSTICK_HINT_Y;
+		if (co >= 0) {
+			gx = tp_fingers[co].ax;
+			gy = tp_fingers[co].ay;
+		}
 		float cx = gx, cy = gy, clit = 0.0f;
 		if (co >= 0) {
 			const float dx = tp_fingers[co].ux - gx, dy = tp_fingers[co].uy - gy;

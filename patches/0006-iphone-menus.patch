@@ -1,0 +1,35 @@
+--- a/src/plugPikiOgawa/ogFileSelect.cpp
++++ b/src/plugPikiOgawa/ogFileSelect.cpp
+@@ -976,7 +976,14 @@ void zen::ogScrFileSelectMgr::start(bool saveMode, int fileSelMode)
+ 
+ 	setDataScale();
+ 
++#ifdef TARGET_PC
++	// PC/iPhone (Justin, 2026-11-25: "Remove the bubbles"): the eight bg_ds bubble
++	// streams rise up the screen edges, which on a phone is exactly where the
++	// touch controls sit, and they carry on over the title screen afterwards.
++	if (false) {
++#else
+ 	if (!mSaveMode) {
++#endif
+ 		Vector3f pos;
+ 		pos.set(320.0f, 240.0f, 0.0f);
+ 		mFxMgr->create(EFF2D_Unk17, pos, nullptr, nullptr);
+--- a/src/plugPikiYamashita/drawWorldMap.cpp
++++ b/src/plugPikiYamashita/drawWorldMap.cpp
+@@ -1301,7 +1301,15 @@ protected:
+ 	void init(statusFlag status)
+ 	{
+ 		mStatus = status;
++#ifdef TARGET_PC
++		// PC widescreen: the hidden Yes/No box is parked at x=640, just past the
++		// right edge of a 4:3 screen. A wider screen shows it hanging off the
++		// right side, so park it far enough out that no aspect can reach it.
++		// Appearing overwrites this position on its first frame.
++		mConfirmScreen->getScreenPtr()->move(4000, 0);
++#else
+ 		mConfirmScreen->getScreenPtr()->move(640, 0);
++#endif
+ 		mConfirmScreen->getScreenPtr()->setScale(1.0f);
+ 		mConfirmScreen->getScreenPtr()->show();
+ 		mAnimTimer        = 0.0f;
