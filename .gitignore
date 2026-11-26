@@ -42,3 +42,4 @@ Texture 0x*.png
 __pycache__/
 *.pyc
 .DS_Store
+hd-art/   # outpainted game art: Nintendo-derived, never committed

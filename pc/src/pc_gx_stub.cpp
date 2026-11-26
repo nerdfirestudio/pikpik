@@ -40,6 +40,8 @@ int pc_window_upload_texture(const unsigned char* rgba, int w, int h, int wrapS,
 void pc_window_release_texture(int handle); // pc_window.mm — hands a slot back
 int pc_window_copy_handle(const void* dest); // pc_window.mm: live EFB-copy texture for a grab destination
 void pc_window_set_tex_offscreen_only(int handle, int on); // pc_window.mm
+void pc_window_set_tex_xgain(int handle, float gain);      // pc_window.mm
+int pc_window_tex_dims(int handle, int* w, int* h);        // pc_window.mm
 bool pc_gx_is_copy_dst(const void* p); // defined below (GXCopyTex tracking)
 
 // Vertex and draw-segment capacity. PC_CAP_MAX_VERTS / PC_CAP_MAX_SEGS are
@@ -1744,6 +1746,12 @@ void GXLoadTexObj(GXTexObj* obj, GXTexMapID map) {
 		                            (int)t->wrapT, (int)t->mip);
 		if (hd >= 0) {
 			pc_window_set_tex_offscreen_only(hd, offscreen_only);
+			// A replacement wider than the original (an outpainted still) draws wider; see pc_window.mm.
+			int pw = 0, ph = 0;
+			float gain = 0.0f;
+			if (pc_window_tex_dims(hd, &pw, &ph) && ph > 0 && t->h > 0)
+				gain = ((float)pw / (float)ph) / ((float)t->w / (float)t->h);
+			pc_window_set_tex_xgain(hd, gain);
 			t->handle   = hd;
 			s_texmap[m] = hd;
 			pc_update_curtex();
@@ -1765,6 +1773,7 @@ void GXLoadTexObj(GXTexObj* obj, GXTexMapID map) {
 	}
 	int handle = pc_window_upload_texture((const unsigned char*)buf, t->w, t->h, (int)t->wrapS, (int)t->wrapT, (int)t->mip);
 	pc_window_set_tex_offscreen_only(handle, offscreen_only); // also clears a reused handle's old mark
+	pc_window_set_tex_xgain(handle, 0.0f);
 	if (getenv("PC_VERBOSE"))
 		fprintf(stderr, "[GXtex] %dx%d fmt=0x%x mip=%d -> handle %d (%d%% nonzero, img=%p)\n", t->w, t->h, t->fmt, (int)t->mip,
 		        handle, npix ? nz * 100 / npix : 0, t->image);

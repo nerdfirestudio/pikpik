@@ -482,6 +482,48 @@ extern "C" void pc_window_set_tex_offscreen_only(int handle, int on) {
 	if (handle >= 0 && handle < PC_MAX_TEXTURES) s_tex_offscreen_only[handle] = on ? 1 : 0;
 }
 
+// WIDENED STILLS (Justin, 2026-11-25: "Use a generative fill on the 4:3 images to fill the
+// screen", then "Do this for all the game still images"). An HD replacement that is WIDER than
+// the texture it replaces (the 640x480 area map outpainted to the phone's shape) records its gain
+// here: (replacement aspect) / (original aspect). The original picture is the centre 1/gain of the
+// replacement, so every triangle drawing it is stretched sideways by the gain about the texture's
+// u = 0.5 line: the middle lands exactly where the game put the 4:3 picture and the painted-in sides
+// fill the width. Where the picture cannot grow (widescreen off, or a 4:3 render-to-texture pass)
+// its u is pulled into the middle instead, so the original framing shows unchanged.
+static float s_tex_xgain[PC_MAX_TEXTURES];
+extern "C" void pc_window_set_tex_xgain(int handle, float gain) {
+	if (handle >= 0 && handle < PC_MAX_TEXTURES) s_tex_xgain[handle] = gain > 1.001f ? gain : 0.0f;
+}
+extern "C" int pc_window_tex_dims(int handle, int* w, int* h) {
+	if (handle < 0 || handle >= PC_MAX_TEXTURES || !s_textures[handle]) return 0;
+	*w = (int)s_textures[handle].width;
+	*h = (int)s_textures[handle].height;
+	return 1;
+}
+static void pc_widen_tris(float* t, int count, float gain, bool grow) {
+	for (int k = 0; k + 2 < count; k += 3, t += 48) {
+		if (!grow) { // keep the 4:3 framing: sample the centre of the wide picture
+			for (int v = 0; v < 3; v++) t[v * 16 + 8] = 0.5f + (t[v * 16 + 8] - 0.5f) / gain;
+			continue;
+		}
+		// x (in NDC) is affine in u across a flat picture: b = dx/du from the widest-apart pair.
+		float x[3], u[3];
+		for (int v = 0; v < 3; v++) {
+			const float w = t[v * 16 + 3] != 0.0f ? t[v * 16 + 3] : 1.0f;
+			x[v] = t[v * 16] / w; u[v] = t[v * 16 + 8];
+		}
+		int a = 0, b = 1; float best = fabsf(u[1] - u[0]);
+		if (fabsf(u[2] - u[0]) > best) { b = 2; best = fabsf(u[2] - u[0]); }
+		if (fabsf(u[2] - u[1]) > best) { a = 1; b = 2; best = fabsf(u[2] - u[1]); }
+		if (best < 1e-4f) continue;
+		const float slope = (x[b] - x[a]) / (u[b] - u[a]);
+		for (int v = 0; v < 3; v++) {
+			const float w = t[v * 16 + 3] != 0.0f ? t[v * 16 + 3] : 1.0f;
+			t[v * 16] = (x[v] + (u[v] - 0.5f) * slope * (gain - 1.0f)) * w;
+		}
+	}
+}
+
 extern "C" void pc_window_submit_tris(const float* verts, int vertCount, int tex, int depth, const PcTevProg* prog) {
 	// Report the UNCAPPED demand: a pinned counter reads the same whether the
 	// frame wanted one vert more than capacity or ten times it.
@@ -1564,6 +1606,12 @@ extern "C" void pc_window_frame(void) {
 			// A triangle reaching both screen edges is a backdrop or fade and is left to fill; every other
 			// 2D triangle (text, icons, HUD) is narrowed by 1/scale around the centre, keeping its 4:3 shape.
 			// Batches that feed a sub-rect EFB copy keep the 4:3 viewport and are not touched.
+			for (int i = 0; i < s_draw_nsegs; i++) {
+				const int stex = s_draw_segs[i].tex;
+				if (stex < 0 || stex >= PC_MAX_TEXTURES || s_tex_xgain[stex] <= 0.0f) continue;
+				const bool grow = ws && !(s_do_letterbox && seg_is_rtt(i));
+				pc_widen_tris(&s_tris[(size_t)s_draw_segs[i].start * 16], s_draw_segs[i].count, s_tex_xgain[stex], grow);
+			}
 			if (ws) {
 				const float inv = 1.0f / s_ws_scale;
 				static int s_wsdbg = -1; if (s_wsdbg < 0) s_wsdbg = getenv("PC_WS_DEBUG") ? 1 : 0;
