@@ -471,6 +471,17 @@ static int pc_widescreen_enabled(void) {
 }
 extern "C" float pc_widescreen_scale(void) { return s_ws_scale; }
 
+// Textures the GameCube only ever drew OFF the edge of its 4:3 screen. The menu
+// layouts (m_select, file select, w_ok, pause and ~40 more) ring their windows
+// with ~100 dot_32/dot_24 bubbles placed outside the frame. A wider view reveals
+// them as columns of bubbles over the touch controls (Justin, 2026-11-25:
+// "Remove the bubbles"). Triangles with these textures that fall wholly outside
+// the original 4:3 frame are dropped; pc_gx_stub.cpp marks the textures by hash.
+static unsigned char s_tex_offscreen_only[PC_MAX_TEXTURES];
+extern "C" void pc_window_set_tex_offscreen_only(int handle, int on) {
+	if (handle >= 0 && handle < PC_MAX_TEXTURES) s_tex_offscreen_only[handle] = on ? 1 : 0;
+}
+
 extern "C" void pc_window_submit_tris(const float* verts, int vertCount, int tex, int depth, const PcTevProg* prog) {
 	// Report the UNCAPPED demand: a pinned counter reads the same whether the
 	// frame wanted one vert more than capacity or ten times it.
@@ -1556,9 +1567,37 @@ extern "C" void pc_window_frame(void) {
 			if (ws) {
 				const float inv = 1.0f / s_ws_scale;
 				static int s_wsdbg = -1; if (s_wsdbg < 0) s_wsdbg = getenv("PC_WS_DEBUG") ? 1 : 0;
-				static int s_wsframe; int n3d = 0, nrtt = 0, nfull = 0, nnar = 0, nseg2d = 0;
+				static int s_wsframe; int n3d = 0, nrtt = 0, nfull = 0, nnar = 0, nseg2d = 0, noff = 0;
 				for (int i = 0; i < s_draw_nsegs; i++) {
-					if (!((s_draw_segs[i].depth >> 12) & 1)) { n3d += s_draw_segs[i].count / 3; continue; }   // 3D: the camera already widened it
+					const bool ortho = (s_draw_segs[i].depth >> 12) & 1;
+					const int stex   = s_draw_segs[i].tex;
+					// Off-frame decorations: drop any triangle the GameCube could not have shown. An ortho
+					// triangle was visible only inside x -1..1; a perspective one (menus drawn by
+					// P2DPerspGraph) only inside the 4:3 slice of the widened view, x -1/scale..1/scale.
+					// Ortho triangles wholly outside -1..1 are dropped whatever their texture: they were
+					// off-screen on the GameCube too, and would otherwise land in the side bars.
+					if (!(s_do_letterbox && seg_is_rtt(i)) && (ortho || (stex >= 0 && stex < PC_MAX_TEXTURES && s_tex_offscreen_only[stex]))) {
+						const float lim = ortho ? 1.0f : inv;
+						float* t = &s_tris[(size_t)s_draw_segs[i].start * 16];
+						for (int k = 0; k + 2 < s_draw_segs[i].count; k += 3, t += 48) {
+							float lo = 1e9f, hi = -1e9f;
+							for (int v = 0; v < 3; v++) {
+								const float w = t[v * 16 + 3] != 0.0f ? t[v * 16 + 3] : 1.0f, x = t[v * 16] / w;
+								if (x < lo) lo = x;
+								if (x > hi) hi = x;
+							}
+							// A bubble half over the frame edge goes too (its centre is outside); for other
+							// ortho triangles only a wholly-outside one is dropped.
+							const float c = ortho && !(stex >= 0 && stex < PC_MAX_TEXTURES && s_tex_offscreen_only[stex])
+							                    ? 0.0f : 0.5f * (lo + hi);
+							if (lo > lim + 0.002f || hi < -lim - 0.002f || c > lim || c < -lim) {
+								// Collapse to a point: zero area, nothing rasterised.
+								for (int v = 1; v < 3; v++) memcpy(&t[v * 16], &t[0], 4 * sizeof(float));
+								noff++;
+							}
+						}
+					}
+					if (!ortho) { n3d += s_draw_segs[i].count / 3; continue; }   // 3D: the camera already widened it
 					if (s_do_letterbox && seg_is_rtt(i)) { nrtt += s_draw_segs[i].count / 3; continue; }
 					nseg2d++;
 					float* t = &s_tris[(size_t)s_draw_segs[i].start * 16];
@@ -1575,7 +1614,7 @@ extern "C" void pc_window_frame(void) {
 					}
 				}
 				if (s_wsdbg && (s_wsframe++ % 120) == 0)
-					fprintf(stderr, "[WS] frame tris: 3d=%d rtt=%d 2d-full=%d 2d-narrowed=%d (2d segs %d, copies %d)\n", n3d, nrtt, nfull, nnar, nseg2d, s_ncopy_events);
+					fprintf(stderr, "[WS] frame tris: 3d=%d rtt=%d 2d-full=%d 2d-narrowed=%d off-frame=%d (2d segs %d, copies %d)\n", n3d, nrtt, nfull, nnar, noff, nseg2d, s_ncopy_events);
 			}
 			memcpy([s_vbuf[s_vbuf_idx] contents], s_tris, (size_t)s_tri_verts * 16 * sizeof(float));
 			[enc setVertexBuffer:s_vbuf[s_vbuf_idx] offset:0 atIndex:0];

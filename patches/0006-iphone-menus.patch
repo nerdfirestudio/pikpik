@@ -1,20 +1,3 @@
---- a/src/plugPikiOgawa/ogFileSelect.cpp
-+++ b/src/plugPikiOgawa/ogFileSelect.cpp
-@@ -976,7 +976,14 @@ void zen::ogScrFileSelectMgr::start(bool saveMode, int fileSelMode)
- 
- 	setDataScale();
- 
-+#ifdef TARGET_PC
-+	// PC/iPhone (Justin, 2026-11-25: "Remove the bubbles"): the eight bg_ds bubble
-+	// streams rise up the screen edges, which on a phone is exactly where the
-+	// touch controls sit, and they carry on over the title screen afterwards.
-+	if (false) {
-+#else
- 	if (!mSaveMode) {
-+#endif
- 		Vector3f pos;
- 		pos.set(320.0f, 240.0f, 0.0f);
- 		mFxMgr->create(EFF2D_Unk17, pos, nullptr, nullptr);
 --- a/src/plugPikiYamashita/drawWorldMap.cpp
 +++ b/src/plugPikiYamashita/drawWorldMap.cpp
 @@ -1301,7 +1301,15 @@ protected:

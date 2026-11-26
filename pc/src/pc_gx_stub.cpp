@@ -39,6 +39,7 @@ void pc_window_submit_tris(const float* verts, int vertCount, int tex, int depth
 int pc_window_upload_texture(const unsigned char* rgba, int w, int h, int wrapS, int wrapT, int mip); // pc_window.mm
 void pc_window_release_texture(int handle); // pc_window.mm — hands a slot back
 int pc_window_copy_handle(const void* dest); // pc_window.mm: live EFB-copy texture for a grab destination
+void pc_window_set_tex_offscreen_only(int handle, int on); // pc_window.mm
 bool pc_gx_is_copy_dst(const void* p); // defined below (GXCopyTex tracking)
 
 // Vertex and draw-segment capacity. PC_CAP_MAX_VERTS / PC_CAP_MAX_SEGS are
@@ -1727,10 +1728,22 @@ void GXLoadTexObj(GXTexObj* obj, GXTexMapID map) {
 			}
 		}
 	}
+	// The menu bubbles (screen dot_32.bti / dot_24.bti) that only ever sat off the 4:3 frame;
+	// pc_window.mm drops them where a wide screen would reveal them. Marked by content hash.
+	int offscreen_only = 0;
+	if ((t->w == 32 && t->h == 32) || (t->w == 24 && t->h == 24)) {
+		const long nb = pc_gc_tex_bytes((int)t->w, (int)t->h, (int)t->fmt);
+		const u64 key = nb ? pc_xxh64((const u8*)t->image, (size_t)nb) : 0;
+		offscreen_only = key == 0x541cc9cb55d36f2full || key == 0x7d443d6fedaf2a14ull;
+		if (getenv("PC_WS_DEBUG"))
+			fprintf(stderr, "[DOTKEY] %ux%u fmt=%u key=%016llx%s\n", t->w, t->h, t->fmt, (unsigned long long)key,
+			        offscreen_only ? " (off-frame bubble)" : "");
+	}
 	{
 		const int hd = pc_hd_lookup((const u8*)t->image, (int)t->w, (int)t->h, (int)t->fmt, (int)t->wrapS,
 		                            (int)t->wrapT, (int)t->mip);
 		if (hd >= 0) {
+			pc_window_set_tex_offscreen_only(hd, offscreen_only);
 			t->handle   = hd;
 			s_texmap[m] = hd;
 			pc_update_curtex();
@@ -1751,6 +1764,7 @@ void GXLoadTexObj(GXTexObj* obj, GXTexMapID map) {
 		return;
 	}
 	int handle = pc_window_upload_texture((const unsigned char*)buf, t->w, t->h, (int)t->wrapS, (int)t->wrapT, (int)t->mip);
+	pc_window_set_tex_offscreen_only(handle, offscreen_only); // also clears a reused handle's old mark
 	if (getenv("PC_VERBOSE"))
 		fprintf(stderr, "[GXtex] %dx%d fmt=0x%x mip=%d -> handle %d (%d%% nonzero, img=%p)\n", t->w, t->h, t->fmt, (int)t->mip,
 		        handle, npix ? nz * 100 / npix : 0, t->image);
