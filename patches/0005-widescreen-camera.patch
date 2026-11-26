@@ -1,6 +1,12 @@
 --- a/src/sysCommon/camera.cpp
 +++ b/src/sysCommon/camera.cpp
-@@ -308,8 +308,20 @@
+@@ -1,3 +1,5 @@
++#include <stdio.h>
++#include <stdlib.h>
+ #include "Camera.h"
+ #include "DebugLog.h"
+ #include "Geometry.h"
+@@ -308,8 +310,25 @@
  /**
   * @todo: Documentation
   */
@@ -14,6 +20,11 @@
 +	// that one number here widens both the projection (setPerspective reads
 +	// mAspectRatio) and the culling planes below, so nothing pops at the new edges.
 +	// Cameras built for other shapes (1.0 shadow and texture cameras) are left alone.
++	{
++		static int dbg = -1;
++		if (dbg < 0) dbg = getenv("PC_WS_DEBUG") ? 1 : 0;
++		if (dbg) { static int n; if (n++ < 40) fprintf(stderr, "[WS] CullFrustum::update aspect=%.4f scale=%.4f fov=%.1f\n", aspectRatio, pc_widescreen_scale(), fov); }
++	}
 +	if (aspectRatio > 1.32f && aspectRatio < 1.35f) {
 +		aspectRatio *= pc_widescreen_scale();
 +	}
@@ -21,3 +32,36 @@
  	mAspectRatio   = aspectRatio;
  	mVerticalScale = 1.0f;
  	mFov           = fov;
+--- a/src/sysDolphin/dgxGraphics.cpp
++++ b/src/sysDolphin/dgxGraphics.cpp
+@@ -1,3 +1,5 @@
++#include <stdio.h>
++#include <stdlib.h>
+ #include "DebugLog.h"
+ #include "Dolphin/os.h"
+ #include "Font.h"
+@@ -784,8 +786,24 @@
+ /**
+  * @todo: Documentation
+  */
++#ifdef TARGET_PC
++extern "C" float pc_widescreen_scale(void); // PC: pc_window.mm, 1.0 when widescreen is off
++#endif
+ void DGXGraphics::setPerspective(Mtx mtx, f32 a1, f32 a2, f32 a3, f32 a4, f32 a5)
+ {
++#ifdef TARGET_PC
++	// PC widescreen: every 3D view in the game passes through here, including ones whose camera
++	// never calls CullFrustum::update (the title screen). A 4:3 aspect is widened to the screen's;
++	// one already widened by CullFrustum::update arrives outside this range and is left alone.
++	{
++		static int dbg = -1;
++		if (dbg < 0) dbg = getenv("PC_WS_DEBUG") ? 1 : 0;
++		if (dbg) { static int n; if (n++ < 30) fprintf(stderr, "[WS] setPerspective fov=%.1f aspect=%.4f scale=%.4f\n", a1, a2, pc_widescreen_scale()); }
++	}
++	if (a2 > 1.32f && a2 < 1.35f) {
++		a2 *= pc_widescreen_scale();
++	}
++#endif
+ 	MTXPerspective(mtx, a1, a2, a3, a4);
+ 	GXSetProjection(mtx, GX_PERSPECTIVE);
+ 	f32 a     = 1.0f / (a4 - a3);

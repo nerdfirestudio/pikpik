@@ -2169,7 +2169,13 @@ void MTXOrtho(Mtx44 m, f32 t, f32 b, f32 l, f32 r, f32 n, f32 f) {
 	m[3][3] = 1.0f;
 }
 
+extern "C" float pc_widescreen_scale(void); // pc_window.mm, 1.0 when widescreen is off
 void MTXPerspective(Mtx44 m, f32 fovY, f32 aspect, f32 n, f32 f) {
+	// Widescreen: the one place every perspective view is built. Gameplay and title cameras arrive
+	// already widened (CullFrustum::update / DGXGraphics::setPerspective, patches/0005), so only a
+	// plain 4:3 request is touched here: the menus and HUD (P2DPerspGraph builds its own view from the
+	// 640x480 port), which then keep their true shape, centred, instead of stretching.
+	if (aspect > 1.32f && aspect < 1.35f) aspect *= pc_widescreen_scale();
 	memset(m, 0, sizeof(f32) * 16);
 	f32 angle = fovY * 0.5f * 3.14159265358979f / 180.0f;
 	f32 cot = __builtin_cosf(angle) / __builtin_sinf(angle);

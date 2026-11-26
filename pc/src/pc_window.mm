@@ -1015,8 +1015,14 @@ static bool pc_window_init(void) {
 	// would stretch the image.
 	Uint32 wflags = SDL_WINDOW_METAL | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
 	if (pc_config_int("video.fullscreen", 0)) wflags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
-	s_window = SDL_CreateWindow("Pikmin", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640 * scale, 480 * scale,
-	                            wflags);
+	// PC_WINDOW_SIZE=WxH opens the window at an exact size (e.g. 1170x540, an iPhone's 19.5:9), so
+	// widescreen can be checked on a Mac without a phone.
+	int win_w = 640 * scale, win_h = 480 * scale;
+	if (const char* ws = getenv("PC_WINDOW_SIZE")) {
+		int w = 0, h = 0;
+		if (sscanf(ws, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 240) { win_w = w; win_h = h; }
+	}
+	s_window = SDL_CreateWindow("Pikmin", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, wflags);
 	if (!s_window) {
 		fprintf(stderr, "[PC] SDL window failed: %s\n", SDL_GetError());
 		s_init_failed = true;
@@ -1542,6 +1548,35 @@ extern "C" void pc_window_frame(void) {
 			need = (need + (4u << 20) - 1) & ~(size_t)((4u << 20) - 1);
 			if (!s_vbuf[s_vbuf_idx] || [s_vbuf[s_vbuf_idx] length] < need)
 				s_vbuf[s_vbuf_idx] = [s_device newBufferWithLength:need options:MTLResourceStorageModeShared];
+			// Widescreen 2D, decided PER TRIANGLE (a whole batch was too coarse: the title's "Best 5" screen
+			// draws its full-width backdrop in the same batch as its text, so the text stretched with it).
+			// A triangle reaching both screen edges is a backdrop or fade and is left to fill; every other
+			// 2D triangle (text, icons, HUD) is narrowed by 1/scale around the centre, keeping its 4:3 shape.
+			// Batches that feed a sub-rect EFB copy keep the 4:3 viewport and are not touched.
+			if (ws) {
+				const float inv = 1.0f / s_ws_scale;
+				static int s_wsdbg = -1; if (s_wsdbg < 0) s_wsdbg = getenv("PC_WS_DEBUG") ? 1 : 0;
+				static int s_wsframe; int n3d = 0, nrtt = 0, nfull = 0, nnar = 0, nseg2d = 0;
+				for (int i = 0; i < s_draw_nsegs; i++) {
+					if (!((s_draw_segs[i].depth >> 12) & 1)) { n3d += s_draw_segs[i].count / 3; continue; }   // 3D: the camera already widened it
+					if (s_do_letterbox && seg_is_rtt(i)) { nrtt += s_draw_segs[i].count / 3; continue; }
+					nseg2d++;
+					float* t = &s_tris[(size_t)s_draw_segs[i].start * 16];
+					for (int k = 0; k + 2 < s_draw_segs[i].count; k += 3, t += 48) {
+						float lo = 1e9f, hi = -1e9f;
+						for (int v = 0; v < 3; v++) {
+							const float w = t[v * 16 + 3] != 0.0f ? t[v * 16 + 3] : 1.0f, x = t[v * 16] / w;
+							if (x < lo) lo = x;
+							if (x > hi) hi = x;
+						}
+						if (lo <= -0.97f && hi >= 0.97f) { nfull++; continue; }
+						for (int v = 0; v < 3; v++) t[v * 16] *= inv;
+						nnar++;
+					}
+				}
+				if (s_wsdbg && (s_wsframe++ % 120) == 0)
+					fprintf(stderr, "[WS] frame tris: 3d=%d rtt=%d 2d-full=%d 2d-narrowed=%d (2d segs %d, copies %d)\n", n3d, nrtt, nfull, nnar, nseg2d, s_ncopy_events);
+			}
 			memcpy([s_vbuf[s_vbuf_idx] contents], s_tris, (size_t)s_tri_verts * 16 * sizeof(float));
 			[enc setVertexBuffer:s_vbuf[s_vbuf_idx] offset:0 atIndex:0];
 			for (int i = 0; i < s_draw_nsegs; i++) {
@@ -1554,18 +1589,7 @@ extern "C" void pc_window_frame(void) {
 				if (ws) {
 					const bool rtt = s_do_letterbox && seg_is_rtt(i);
 					set_vp(rtt ? 1 : 0);
-					float xs = 1.0f;
-					if (!rtt && ((s_draw_segs[i].depth >> 12) & 1)) {
-						// 2D batch: keep its 4:3 shape unless it covers the full width.
-						float lo = 1e9f, hi = -1e9f;
-						const float* vv = &s_tris[(size_t)s_draw_segs[i].start * 16];
-						for (int k = 0; k < s_draw_segs[i].count; k++, vv += 16) {
-							const float w = vv[3] != 0.0f ? vv[3] : 1.0f, x = vv[0] / w;
-							if (x < lo) lo = x;
-							if (x > hi) hi = x;
-						}
-						if (!(lo <= -0.97f && hi >= 0.97f)) xs = 1.0f / s_ws_scale;
-					}
+					const float xs = 1.0f; // 2D narrowing now happens per triangle before upload
 					[enc setVertexBytes:&xs length:sizeof(xs) atIndex:1];
 				}
 				static int s_nodepth = -1;
