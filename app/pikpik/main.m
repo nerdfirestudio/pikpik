@@ -18,11 +18,14 @@
 extern int SDL_main(int argc, char *argv[]); /* pc_ios_main.cpp */
 
 int main(int argc, char *argv[]) {
-    /* iOS: SDL's CoreAudio backend defaults the AVAudioSession category to
-     * "ambient", which is silenced by the mute switch / Control Center mute
-     * and stops on screen lock. "playback" is the game-audio category: it
-     * plays regardless of the mute setting. Must be set before audio init. */
-    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+    /* iOS: "ambient" (AVAudioSessionCategoryAmbient) obeys the ring/silent
+     * switch: flip it to silent and the game goes quiet, like every other
+     * iPhone game. It also mixes with whatever music is already playing.
+     * Was "playback" (plays through the silent switch) until 2026-11-26;
+     * Justin: "silent on iPhone when silent switch is on". SDL 2.32.10
+     * accepts "ambient" (SDL_coreaudio.m update_audio_session). Must be set
+     * before audio init. */
+    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "ambient");
 
     /* Defer the home-indicator swipe (the first swipe reveals the bar, the
      * second acts) so bottom-edge touches don't background the game. */
